@@ -1,13 +1,6 @@
 ```markdown
 # GhostRelay
 
-Hello everyone from the Meshtastic community,
-
-I have been working for a few months on a project aiming to create a decentralized means of communication. The proposal is to develop a system where the network nodes themselves collaborate in message retransmission, using cryptographic signatures and an incentive mechanism based on message return.
-
-Below is the detailed explanation of the system logic, as well as a script that can be used on your radio transmitter to join the network.
-
----
 
 ## 📡 Detailed Description of the Operation
 
