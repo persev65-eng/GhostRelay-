@@ -1,0 +1,14 @@
+{
+  "connection_type": "tcp",
+
+  "fallback_order": ["tcp", "usb", "bluetooth"],
+
+  "tcp_host": "127.0.0.1",
+  "tcp_port": 8080,
+
+  "usb_device": "/dev/ttyUSB0",
+  "baudrate": 115200,
+
+  "bt_device": "/dev/rfcomm0",
+  "bt_baudrate": 115200
+}
