@@ -158,24 +158,50 @@ Plaintext messages (without `:contact`) still work, but they ask for confirmatio
 ```python
 #!/usr/bin/env python3
 """
-GhostRelay - LoRa retransmission with ECDSA signature and credit by return order.
+GhostRelay - LoRa mesh relay with ECDSA signatures, ECIES encryption, and credit system.
 
 PROTOCOL:
-  - Node A creates: payload = text + 16hex timestamp
-                 signs with private key → tx <payload><sigA>
-  - Node B receives: checks sigA against trusted_keys.json.
-      Unknown key   → silently discard.
-      Known key     → remove sigA, sign same payload with sigB → retransmit.
+  - Node A creates: payload = text + 16hex_timestamp
+                    signs with private key → tx <payload><sigA>
+  - Node B receives: verifies sigA against trusted_keys.json.
+      Unknown key → silently discard.
+      Known key   → strip sigA, sign same payload with sigB → retransmit.
       Queue priority = accumulated credit of the signer who delivered the message.
-  - When msg[sigB] returns to A: A recognizes payload (original_cache),
-      credits B with total_pts // position (1st=100%, 2nd=50%, 3rd=33%, N=100/N%).
+  - When msg[sigB] returns to A: A recognises payload (original_cache),
+      credits B with total_pts // place (1st=100%, 2nd=50%, 3rd=33%, N=100/N%).
   - When msg[sigB] arrives at D: D treats it as a new message from B,
-      re‑signs with sigD. When sigD returns to B: B recognizes payload
-      (relayed_cache), credits D — same logic.
-  - Time window: timestamp > 20 min in past or > 10 min in future → discard.
+      re-signs with sigD. When sigD returns to B: B recognises payload
+      (relayed_cache) and credits D — same logic at every hop.
+  - Time window: timestamp older than 20 min or more than 10 min in future → discard.
   - Duplicate: same (payload, signer_fp) → ignore.
   - Max buffer: 10 MB.
-  - Contacts and ECIES encryption: see README.
+
+CONTACTS AND ENCRYPTION:
+  - Contacts stored in contacts.json: name → public key PEM.
+  - Encrypted send: "message:contact_name"
+      Message is encrypted with ECIES (ECDH ephemeral + HKDF + AES-256-GCM).
+      Travels the network as opaque base64 — indistinguishable from random data.
+      Only the holder of the matching private key can decrypt it.
+  - Plaintext send: "message" (no :contact suffix)
+      Displays a warning and asks for confirmation before sending.
+  - Every received message is silently attempted for decryption.
+      If it succeeds → shown as private. Otherwise shown as plaintext.
+  - addcontact <name> <base64_or_PEM> — add a contact.
+
+PACKET FORMAT ON THE NETWORK:
+  tx <payload><sig88chars>\n
+  payload = <content_utf8><16hex_timestamp>
+  content = plaintext OR base64(ECIES blob) — no prefix, no marker
+  sig     = base64 of 64-byte ECDSA NIST-P256 signature → always 88 chars
+
+ECIES BLOB LAYOUT (bytes before base64 encoding):
+  [0 :33] ephemeral compressed public key (SECP256R1)
+  [33:45] AES-GCM nonce (12 bytes)
+  [45:  ] ciphertext + GCM authentication tag (16 bytes at the end)
+
+CREDITS:
+  Persisted atomically to credits.json and credited_order.json every 10 s.
+  Nodes with more credit have their messages prioritised in the relay queue.
 """
 
 import base64
@@ -192,6 +218,7 @@ import threading
 import time
 from pathlib import Path
 
+# ECDSA signing / verification
 from ecdsa import BadSignatureError, NIST256p, SigningKey, VerifyingKey
 from ecdsa.util import sigdecode_string, sigencode_string
 
@@ -220,16 +247,17 @@ CREDITED_ORDER_PATH = APP_DIR / "credited_order.json"
 
 MAX_BUFFER_BYTES      = 10 * 1024 * 1024  # 10 MB
 MAX_MSG_LEN           = 200               # max bytes of plaintext (excl. timestamp + sig)
-MAX_ENC_LEN           = 400               # max bytes of encrypted content (larger than plaintext)
+MAX_ENC_LEN           = 400               # max bytes of encrypted blob (larger than plaintext)
 MAX_RECV_BUF          = 64 * 1024         # 64 KB — max newline-free TCP fragment
 CACHE_EXPIRE_SEC      = 20 * 60
 MAX_RELAY_AGE_SEC     = 20 * 60           # reject timestamps older than 20 min
 MAX_FUTURE_SEC        = 10 * 60           # reject timestamps more than 10 min ahead
-SIG_CHARS             = 88               # base64(64 bytes) → 88 chars, always
+SIG_CHARS             = 88                # base64(64 bytes) → 88 chars, always
 TIMESTAMP_CHARS       = 16               # 16 hex chars = uint64 nanoseconds
 CREDITS_SAVE_INTERVAL = 10               # seconds between credit saves
 CACHE_CLEAN_INTERVAL  = 60               # seconds between cache cleanups
-MAX_PRIO_REORDERS     = 5                # max consecutive priority re-evaluations
+MAX_PRIO_REORDERS     = 5                # max consecutive priority re-evaluations before forcing send
+CONNECT_TIMEOUT_SEC   = 10               # TCP connect timeout
 HKDF_INFO             = b"ghostrelay-ecies-v1"
 
 ESP_CMDS = {"status", "help", "reset", "diag", "debug3", "sf", "bw", "freq", "cr", "pwr"}
@@ -264,6 +292,11 @@ def load_or_create_key():
         return key
     key = SigningKey.generate(curve=NIST256p)
     KEY_PATH.write_bytes(key.to_pem())
+    # restrict key file to owner-read-write only (600)
+    try:
+        os.chmod(KEY_PATH, 0o600)
+    except Exception as e:
+        log.warning("[KEY] Could not set key file permissions: %s", e)
     log.info("[KEY] Generated new private key at %s", KEY_PATH)
     return key
 
@@ -287,12 +320,22 @@ MY_NODE_ID = _fp(MY_VK)
 def _save_atomic(path, data):
     """Write JSON atomically via a temp file + os.replace."""
     APP_DIR.mkdir(exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w", dir=APP_DIR, delete=False, suffix=".tmp"
-    ) as tf:
-        json.dump(data, tf, indent=2, ensure_ascii=False)
-        tmp = tf.name
-    os.replace(tmp, path)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", dir=APP_DIR, delete=False, suffix=".tmp"
+        ) as tf:
+            json.dump(data, tf, indent=2, ensure_ascii=False)
+            tmp = tf.name
+        os.replace(tmp, path)
+    except Exception:
+        # Remove the orphaned temp file so it doesn't accumulate on disk
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        raise
 
 # ------------------------------------------------------------------------------
 # Trusted relay nodes  (trusted_keys.json)
@@ -302,6 +345,7 @@ trusted_lock = threading.Lock()
 _trusted = {}   # fp → VerifyingKey
 
 def load_trusted_keys():
+    """Load trusted_keys.json from disk. No locks — caller decides."""
     if not TRUSTED_KEYS_PATH.exists():
         return {}
     with open(TRUSTED_KEYS_PATH) as f:
@@ -320,8 +364,9 @@ def get_trusted():
         return dict(_trusted)
 
 def reload_trusted():
+    """Reload from disk. I/O happens outside the lock to avoid blocking."""
     global _trusted
-    loaded = load_trusted_keys()
+    loaded = load_trusted_keys()        # file I/O — no lock held here
     with trusted_lock:
         _trusted = loaded
 
@@ -367,6 +412,10 @@ contacts_lock = threading.Lock()
 _contacts = {}
 
 def _parse_contact_key(pem_or_b64):
+    """
+    Parse a public key from PEM or raw base64 DER.
+    Returns (VerifyingKey, EllipticCurvePublicKey).
+    """
     raw = pem_or_b64.strip()
     if not raw.startswith("-----"):
         raw = f"-----BEGIN PUBLIC KEY-----\n{raw}\n-----END PUBLIC KEY-----\n"
@@ -375,6 +424,7 @@ def _parse_contact_key(pem_or_b64):
     return vk_ecdsa, vk_crypto
 
 def load_contacts():
+    """Load contacts.json from disk. Called once at startup."""
     global _contacts
     if not CONTACTS_PATH.exists():
         return
@@ -399,11 +449,13 @@ def load_contacts():
         log.warning("[CONTACTS] Failed to load contacts.json: %s", e)
 
 def _save_contacts():
+    """Persist contacts to disk (called after every mutation)."""
     with contacts_lock:
         snap = {v["name"]: v["vk"].to_pem().decode() for v in _contacts.values()}
     _save_atomic(CONTACTS_PATH, snap)
 
 def add_contact(name, pem_or_b64):
+    """Add or update a contact. Returns True on success."""
     try:
         vk_ecdsa, vk_crypto = _parse_contact_key(pem_or_b64)
     except Exception as e:
@@ -417,6 +469,10 @@ def add_contact(name, pem_or_b64):
     return True
 
 def get_contact(name):
+    """
+    Look up a contact by name (case-insensitive).
+    Returns a *copy* of the entry dict, or None.
+    """
     with contacts_lock:
         entry = _contacts.get(name.lower())
         return dict(entry) if entry is not None else None
@@ -446,6 +502,16 @@ def _derive_aes_key(shared_secret: bytes) -> bytes:
     ).derive(shared_secret)
 
 def encrypt_for_contact(plaintext: str, vk_crypto) -> str:
+    """
+    Encrypt plaintext for a recipient using ECIES.
+    Returns a base64 string (no prefix or marker).
+    Indistinguishable from random data to any third party.
+
+    Blob layout (before base64):
+      [0 :33] ephemeral compressed public key
+      [33:45] AES-GCM nonce (12 bytes, random)
+      [45:  ] ciphertext + 16-byte GCM tag
+    """
     eph_sk        = generate_private_key(SECP256R1())
     shared        = eph_sk.exchange(ECDH(), vk_crypto)
     aes_key       = _derive_aes_key(shared)
@@ -458,7 +524,15 @@ def encrypt_for_contact(plaintext: str, vk_crypto) -> str:
     return base64.b64encode(eph_pub_bytes + nonce + ciphertext).decode("ascii")
 
 def decrypt_message(content: str):
+    """
+    Silently attempt to decrypt content using our private key.
+    Returns the plaintext string if decryption succeeds, else None.
+
+    Failure is the normal case for messages addressed to other nodes —
+    the AES-GCM authentication tag cleanly rejects wrong keys.
+    """
     try:
+        # validate=True rejects non-base64 characters immediately
         raw = base64.b64decode(content, validate=True)
         if len(raw) < 33 + 12 + 16:
             return None
@@ -523,6 +597,7 @@ def add_credit(fp, points):
     with credits_lock:
         credits[fp] = credits.get(fp, 0) + points
         total = credits[fp]
+    # Log outside the lock — avoids potential deadlock with logging handlers
     log.info("[CREDIT] +%d to %s (total: %d)", points, fp, total)
 
 # ------------------------------------------------------------------------------
@@ -543,6 +618,7 @@ def mark_relayed(payload):
         relayed_cache[payload] = time.monotonic()
 
 def i_know_payload(payload):
+    """True if I created OR already relayed this payload."""
     with cache_lock:
         return payload in original_cache or payload in relayed_cache
 
@@ -564,6 +640,7 @@ def clean_caches_once():
         for k in [k for k, t in seen_packets.items() if t < cutoff]:
             seen_packets.pop(k, None)
         known = set(original_cache) | set(relayed_cache)
+    # Remove credited_order entries for payloads no longer in any cache
     with credited_order_lock:
         for p in [p for p in credited_order if p not in known]:
             del credited_order[p]
@@ -581,13 +658,15 @@ def cache_cleaner_thread():
 # ------------------------------------------------------------------------------
 
 def sign_payload(payload: str) -> str:
+    """Sign payload with our private key. Returns always-88-char base64."""
     digest    = hashlib.sha256(payload.encode("utf-8")).digest()
     sig_bytes = sk.sign_digest(digest, sigencode=sigencode_string)
     return base64.b64encode(sig_bytes).decode("ascii")
 
 def verify_payload(payload: str, sig_b64: str, vk) -> bool:
     try:
-        sig    = base64.b64decode(sig_b64)
+        # validate=True: reject malformed base64 before passing to crypto
+        sig    = base64.b64decode(sig_b64, validate=True)
         digest = hashlib.sha256(payload.encode("utf-8")).digest()
         vk.verify_digest(sig, digest, sigdecode=sigdecode_string)
         return True
@@ -595,6 +674,10 @@ def verify_payload(payload: str, sig_b64: str, vk) -> bool:
         return False
 
 def identify_signer(payload: str, sig_b64: str):
+    """
+    Try to match (payload, sig) against our own key, then all trusted nodes.
+    Returns (fingerprint, VerifyingKey) or None.
+    """
     if verify_payload(payload, sig_b64, MY_VK):
         return (MY_NODE_ID, MY_VK)
     for fp, vk in get_trusted().items():
@@ -618,6 +701,8 @@ def is_timestamp_valid(ts_hex: str) -> bool:
 
 # ------------------------------------------------------------------------------
 # Priority queue
+# heap entries: (priority, enqueue_time, payload, origin_fp, size)
+# priority = -credit(origin_fp): lower number = higher priority = more credit
 # ------------------------------------------------------------------------------
 
 queue_lock           = threading.Lock()
@@ -642,12 +727,18 @@ def enqueue(payload: str, origin_fp: str):
 send_lock = threading.Lock()
 
 def safe_send(sock, data: bytes):
+    """
+    Thread-safe send. Sets socket to blocking for the duration of the send.
+    """
     with send_lock:
-        sock.setblocking(True)
         try:
+            sock.setblocking(True)
             sock.sendall(data)
         finally:
-            sock.setblocking(False)
+            try:
+                sock.setblocking(False)
+            except Exception:
+                pass   # socket may already be closed; ignore
 
 def retransmit_worker(sock, stop_event):
     global current_buffer_bytes
@@ -666,6 +757,9 @@ def retransmit_worker(sock, stop_event):
 
         stored_prio, enqueue_time, payload, origin_fp, size = item
 
+        # Re-evaluate priority (credit may have changed since enqueue).
+        # Bounded by MAX_PRIO_REORDERS to prevent infinite re-queueing
+        # when the entire queue has stale priorities simultaneously.
         current_prio = -get_credit(origin_fp)
         if current_prio != stored_prio and reorder_count < MAX_PRIO_REORDERS:
             with queue_lock:
@@ -679,17 +773,13 @@ def retransmit_worker(sock, stop_event):
 
         reorder_count = 0
 
+        # Discard if we have already relayed or created this payload
         if i_know_payload(payload):
             with queue_lock:
                 current_buffer_bytes = max(0, current_buffer_bytes - size)
             continue
 
-        if len(payload) < TIMESTAMP_CHARS:
-            log.warning("[TX] Payload too short, dropped")
-            with queue_lock:
-                current_buffer_bytes = max(0, current_buffer_bytes - size)
-            continue
-
+        # Timestamp may have expired while the message waited in the queue
         if not is_timestamp_valid(payload[-TIMESTAMP_CHARS:]):
             log.info("[TX] Timestamp expired in queue — dropped")
             with queue_lock:
@@ -722,12 +812,18 @@ def retransmit_worker(sock, stop_event):
 # ------------------------------------------------------------------------------
 
 def handle_lora_packet(content: str):
+    """
+    Process one packet received from the ESP32.
+    content = everything after "[LoRa] ", with any leading "tx " already stripped.
+    Expected structure: <payload><sig88chars>
+    """
     if len(content) < TIMESTAMP_CHARS + SIG_CHARS + 1:
         return
 
     sig_b64 = content[-SIG_CHARS:]
-    payload = content[:-SIG_CHARS]
+    payload  = content[:-SIG_CHARS]
 
+    # 1. Identify and verify signer
     result = identify_signer(payload, sig_b64)
     if result is None:
         log.debug("[RX] Unknown signer or bad signature")
@@ -735,32 +831,45 @@ def handle_lora_packet(content: str):
 
     signer_fp, _ = result
 
+    # 2. Ignore echo of our own transmissions
     if signer_fp == MY_NODE_ID:
         return
 
-    if len(payload) < TIMESTAMP_CHARS:
-        return
+    # 3. Validate timestamp
+    # NOTE: len(payload) >= TIMESTAMP_CHARS is guaranteed by the length check above
     if not is_timestamp_valid(payload[-TIMESTAMP_CHARS:]):
         log.debug("[RX] Timestamp out of window")
         return
 
+    # 4. Deduplication: same payload + same signer → ignore
     if already_seen(payload, signer_fp):
         return
     mark_seen(payload, signer_fp)
 
+    # 5. Known payload → it's a return of something we sent or relayed → credit
+    #    Compute reward inside the lock but call add_credit OUTSIDE it.
+    #    This avoids holding credited_order_lock while acquiring credits_lock.
     if i_know_payload(payload):
+        reward = None
+        place  = None
         with credited_order_lock:
             order = credited_order.setdefault(payload, [])
             if signer_fp not in order:
-                place     = len(order) + 1
+                place     = len(order) + 1   # 1-based position
                 text_len  = len(payload[:-TIMESTAMP_CHARS].encode("utf-8"))
                 total_pts = text_len + TIMESTAMP_CHARS + SIG_CHARS
+                # 1st=100%, 2nd=50%, 3rd=33%, Nth=100/N% of total bytes
                 reward = max(1, total_pts // place)
-                add_credit(signer_fp, reward)
+                # Append BEFORE releasing lock to prevent a race where another
+                # thread credits the same signer for the same payload
                 order.append(signer_fp)
-                log.info("[CREDIT] %s | place %d | +%d pts", signer_fp, place, reward)
+        # Credit and log happen outside the credited_order_lock
+        if reward is not None:
+            add_credit(signer_fp, reward)
+            log.info("[CREDIT] %s | place %d | +%d pts", signer_fp, place, reward)
         return
 
+    # 6. New message → try silent decryption, display, then queue for relay
     content_part = payload[:-TIMESTAMP_CHARS]
     decrypted    = decrypt_message(content_part)
     if decrypted is not None:
@@ -861,6 +970,7 @@ def main():
     threading.Thread(target=credits_saver_thread, daemon=True, name="credits-saver").start()
     threading.Thread(target=cache_cleaner_thread,  daemon=True, name="cache-cleaner").start()
 
+    # Pending plaintext confirmation: (packet_bytes, payload_str) or None
     pending_confirm = None
 
     while True:
@@ -869,9 +979,12 @@ def main():
         worker     = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # set connect timeout so a silent drop doesn't block forever
+            sock.settimeout(CONNECT_TIMEOUT_SEC)
             sock.connect((HOST, PORT))
-            log.info("[NET] Connected to %s:%d", HOST, PORT)
+            # Switch to non-blocking AFTER the connect succeeds
             sock.setblocking(False)
+            log.info("[NET] Connected to %s:%d", HOST, PORT)
 
             stop_event = threading.Event()
             worker = threading.Thread(
@@ -887,6 +1000,7 @@ def main():
             while True:
                 r, _, _ = select.select([sock, sys.stdin], [], [], 0.2)
 
+                # ── Data from ESP32 ──
                 if sock in r:
                     try:
                         chunk = sock.recv(4096).decode("utf-8", errors="replace")
@@ -896,6 +1010,7 @@ def main():
 
                         recv_buf += chunk
 
+                        # Process all complete lines first
                         while "\n" in recv_buf:
                             line, recv_buf = recv_buf.split("\n", 1)
                             line = line.strip()
@@ -909,6 +1024,7 @@ def main():
                             else:
                                 print(f"[ESP32] {line}")
 
+                        # Then guard against an unbounded newline-free fragment
                         if len(recv_buf) > MAX_RECV_BUF:
                             log.warning(
                                 "[NET] Fragment without newline exceeds %d KB — discarded",
@@ -924,6 +1040,7 @@ def main():
                         log.error("[NET] Read error: %s", e)
                         break
 
+                # ── User input ──
                 if sys.stdin in r:
                     try:
                         cmd = sys.stdin.readline()
@@ -935,17 +1052,24 @@ def main():
 
                     low = cmd.lower()
 
+                    # ── Pending plaintext confirmation ──
                     if pending_confirm is not None:
                         if low == "yes":
                             packet, payload = pending_confirm
-                            safe_send(sock, packet)
-                            mark_original(payload)
-                            log.info("[SENT PLAINTEXT] ts=%s", payload[-TIMESTAMP_CHARS:])
+                            # re-check timestamp before sending —
+                            # the user may have taken too long to answer
+                            if not is_timestamp_valid(payload[-TIMESTAMP_CHARS:]):
+                                print("✗ Message expired while waiting for confirmation — not sent.")
+                            else:
+                                safe_send(sock, packet)
+                                mark_original(payload)
+                                log.info("[SENT PLAINTEXT] ts=%s", payload[-TIMESTAMP_CHARS:])
                         else:
                             print("✗ Send cancelled.")
                         pending_confirm = None
                         continue
 
+                    # ── Internal commands (all case-insensitive) ──
                     if low == "credits":
                         cmd_credits()
                     elif low == "queue":
@@ -959,14 +1083,14 @@ def main():
                     elif low == "clear":
                         print("\033[2J\033[H", end="")
 
-                    elif cmd.startswith("addnode "):
+                    elif low.startswith("addnode "):
                         parts = cmd.split(maxsplit=2)
                         if len(parts) == 3:
                             add_trusted_node(parts[1], parts[2])
                         else:
                             print("Usage: addnode <name> <base64_key_or_PEM>")
 
-                    elif cmd.startswith("addcontact "):
+                    elif low.startswith("addcontact "):
                         parts = cmd.split(maxsplit=2)
                         if len(parts) == 3:
                             add_contact(parts[1], parts[2])
@@ -978,6 +1102,9 @@ def main():
                         print(f"[CMD] {cmd}")
 
                     else:
+                        # ── Send a message ──
+                        # Syntax: "text:contact" for encrypted, "text" for plaintext.
+                        # Split on the LAST ":" so colons inside the text are allowed.
                         contact_name = None
                         text         = cmd
 
@@ -993,6 +1120,7 @@ def main():
                             continue
 
                         if contact_name:
+                            # ── Encrypted send ──
                             c = get_contact(contact_name)
                             try:
                                 enc_blob = encrypt_for_contact(text, c["vk_crypto"])
@@ -1013,6 +1141,7 @@ def main():
                             print(f"🔒 [SENT ENCRYPTED] to '{c['name']}'")
 
                         else:
+                            # ── Plaintext send — ask for confirmation ──
                             if len(text.encode("utf-8")) > MAX_MSG_LEN:
                                 print(f"[ERROR] Message too long (max {MAX_MSG_LEN} UTF-8 bytes)")
                                 continue
@@ -1029,6 +1158,10 @@ def main():
 
         except ConnectionRefusedError:
             log.warning("[NET] Connection refused — retrying in 5s...")
+            pending_confirm = None
+            time.sleep(5)
+        except socket.timeout:
+            log.warning("[NET] Connect timed out after %ds — retrying in 5s...", CONNECT_TIMEOUT_SEC)
             pending_confirm = None
             time.sleep(5)
         except Exception as e:
@@ -1060,7 +1193,7 @@ if __name__ == "__main__":
 · ESP32 with a LoRa module (LR1121 or compatible) flashed with firmware that bridges Bluetooth ↔ LoRa (e.g., teste_lr1121.ino).
 · Bluetooth TCP Bridge app (from Play Store).
 
-2. Install dependencies in Termux
+1. Install dependencies in Termux
 
 ```bash
 pkg update && pkg upgrade -y
@@ -1068,7 +1201,7 @@ pkg install python
 pip install ecdsa cryptography
 ```
 
-3. Create directory and configuration file
+1. Create directory and configuration file
 
 ```bash
 mkdir -p ~/lora_relay
@@ -1080,7 +1213,7 @@ cat > ~/lora_relay/config.json << 'EOF'
 EOF
 ```
 
-4. Create the main script
+1. Create the main script
 
 Copy the full GhostRelay code (provided above) into Termux:
 
@@ -1090,21 +1223,21 @@ cat > ~/lora_relay/relay.py << 'EOF'
 EOF
 ```
 
-5. Configure the Bluetooth bridge
+1. Configure the Bluetooth bridge
 
 · Open the Bluetooth TCP Bridge app.
 · Add Device A: Connect to classic Bluetooth device → select your ESP32.
 · Add Device B: Start TCP server → port 8080.
 · Tap the >> icon to start the bridge.
 
-6. Run the node
+1. Run the node
 
 ```bash
 cd ~/lora_relay
 python3 relay.py
 ```
 
-7. Add other trusted nodes (for relay)
+1. Add other trusted nodes (for relay)
 
 · On the other node, type mykey and copy the Base64 DER line.
 · In your terminal, type:
@@ -1113,7 +1246,7 @@ python3 relay.py
 addnode NodeName MFkwE... (paste the base64 key)
 ```
 
-8. Add contacts (for encrypted messaging)
+1. Add contacts (for encrypted messaging)
 
 · Obtain the public key of the contact (ask them to run mykey and copy the Base64 DER line).
 · In your terminal, type:
@@ -1122,7 +1255,7 @@ addnode NodeName MFkwE... (paste the base64 key)
 addcontact ContactName MFkwE... (paste the base64 key)
 ```
 
-9. Useful commands
+1. Useful commands
 
 Command Description
 contacts List saved contacts
@@ -1137,7 +1270,7 @@ clear Clear the screen
 <text> Send a plaintext message (confirmation required)
 status, sf 9, freq 915 Direct ESP32 commands
 
-10. Stop the script
+1. Stop the script
 
 Press Ctrl+C.
 
