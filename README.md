@@ -1,4 +1,3 @@
-```markdown
 # GhostRelay
 
 Hello everyone from the Mesh networking community,
@@ -15,7 +14,7 @@ When a node A creates a message, it performs the following steps:
 
 1. It builds the message containing:  
    - the payload (content)  
-   - a timestamp  
+   - a timestamp (16 hex characters from `time.time_ns()`)
 
 2. Then it signs the message with its private key  
 
@@ -35,12 +34,11 @@ When node B receives this message, it performs the following sequence:
 
 **2. Signature replacement**  
 - B removes the original signature (from A)  
-- B signs the message again using its own private key  
+- B signs the same payload again using its own private key  
 
 **3. Priority definition**  
-- B checks the priority associated with its wallet (public key)  
-- Based on that, it organizes a retransmission queue  
-- Queue rules: Messages with higher priority are placed closer to the top; messages at the top are retransmitted first  
+- Each message is assigned an **initial priority** equal to the current credit of the node that delivered it (the signer).  
+- B maintains a retransmission queue (max 10 MB) where messages are ordered by priority (higher priority = earlier transmission).  
 
 **4. Retransmission**  
 - B retransmits the message with its own signature  
@@ -61,23 +59,26 @@ If these conditions are met:
 2. A rewards B with points  
 
 **💰 Scoring rule**  
-The number of points is based on the message size:  
-`points = number of bytes in the message`
+The number of points is based on the message size (payload + timestamp + signature).  
+Points = total bytes // **position** (where position = 1 for the first return, 2 for the second, etc.).  
+
+👉 **A node can earn points multiple times for the same message.**  
+If the same node B returns the same payload again later (because it retransmitted it again), it will occupy the next free position in the return order and receive fewer points.  
+
+Example:  
+- Message size = 100 bytes.  
+- B returns first → position 1 → reward = 100 // 1 = 100 points.  
+- C returns second → position 2 → reward = 100 // 2 = 50 points.  
+- B returns third (again) → position 3 → reward = 100 // 3 = 33 points.  
+
+Thus, the earlier a node returns a message, the more points it gets, and the same node can collect multiple decreasing rewards over time.
 
 ---
 
 ### 🏁 Multiple nodes retransmitting (e.g., B, C, D)
 
-If multiple nodes retransmit the same message:  
-- The node whose retransmission returns first receives more points  
-- The others receive progressively fewer points  
-
-Example:  
-1. B retransmits and the message returns first → receives 100% of the points  
-2. C retransmits later → receives 50%  
-3. D retransmits later → receives 33%  
-
-In other words, the reward depends on the order in which the message returns.
+All nodes that ever retransmit the same message are eligible for rewards when the message returns to the original creator.  
+The **order of return** determines the reward: the first returner gets the highest reward, the second gets half, the third gets one third, etc.
 
 ---
 
@@ -104,8 +105,8 @@ At this point:
 When the message returns:  
 - If it returns to B with D’s signature:  
   - B understands that D retransmitted its message  
-  - B rewards D  
-- At the same time: A has already rewarded B  
+  - B rewards D (according to the same position logic from B’s perspective)  
+- At the same time: A has already rewarded B (for the first return)  
 
 ✔️ **General rule**  
 👉 Each node rewards whoever retransmitted the version of the message that it signed.
@@ -117,6 +118,8 @@ When the message returns:
 To control propagation:  
 1. **Old messages** – If the timestamp is more than 20 minutes in the past → the message is **not** retransmitted  
 2. **Future messages** – If the timestamp is more than 10 minutes ahead of the node’s clock → the message is **not** retransmitted  
+
+Additionally, each message in the retransmission queue has a **maximum lifetime of 60 seconds**; after that, it is automatically discarded.
 
 ---
 
@@ -217,7 +220,7 @@ addnode <name> <base64_key> Add a trusted relay node (its public key)
 addcontact <name> <base64_key> Add a contact for encrypted messaging
 contacts List all contacts
 credits View points earned from retransmissions
-queue See the retransmission queue (ordered by credit)
+queue See the retransmission queue (ordered by current priority)
 trusted List trusted relay nodes
 <message>:<contact> Send an encrypted message to that contact
 <message> Send a plaintext message (asks confirmation)
