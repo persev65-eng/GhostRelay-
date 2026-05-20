@@ -8,154 +8,148 @@ Below is the detailed explanation of the system logic. The complete script and i
 
 ---
 
-## 📡 Detailed Description of the Operation
+## 📡 Overview
 
-When a node A creates a message, it performs the following steps:
+GhostRelay is a **reputation‑based mesh relay protocol** for low‑bandwidth LoRa networks (ESP32). Every node maintains:
 
-1. It builds the message containing:  
-   - the payload (content)  
-   - a timestamp (16 hex characters from `time.time_ns()`)
+- A **FIFO cache** (default 10 000 entries) to avoid processing the same message more than once.
+- A **trusted_keys list** of nodes that have already proven useful, along with their accumulated points.
+- A **candidates list** of nodes that sent an `invite` but have not yet returned any message.
+- A **priority queue** for retransmission – messages from high‑reputation nodes go out first, and the priority decays with each hop.
+- A **race window** (60 s) during which the original author awards points to anyone who returns the message.
 
-2. Then it signs the message with its private key  
-
-3. After that, it transmits the message to the network  
-
----
-
-### 🔁 Reception by another node (e.g., B)
-
-When node B receives this message, it performs the following sequence:
-
-**1. Signature verification**  
-- B extracts the signature from the message  
-- It checks its “notebook” (local list `trusted_keys.json`) to see if there is a corresponding public key  
-- If not found → the message is discarded and not retransmitted  
-- If found → the message is considered valid  
-
-**2. Signature replacement**  
-- B removes the original signature (from A)  
-- B signs the same payload again using its own private key  
-
-**3. Duplicate and relay prevention**  
-- B checks if it has already **relayed this exact payload** (stored in `relayed_cache` with key `(payload, B_fingerprint)`).  
-- If yes → the message is ignored (prevents infinite loops).  
-
-**4. Priority definition**  
-- Each **new** message (never seen before by B) is assigned an **initial priority** equal to the current credit of the **original sender** (the one who created the message).  
-- If the sender has no credits, a minimum base of 10 is used.  
-- B maintains a retransmission queue (max 10 MB) where messages are ordered by priority (higher priority = earlier transmission).  
-
-**5. Retransmission**  
-- B retransmits the message with its own signature  
-
-**6. Priority decay and requeue**  
-- After each successful retransmission, the message’s priority is recalculated:  
-  `new_value = base // (number_of_retransmissions_done + 1)`  
-- If the new value is still ≥ 1 and the message’s TTL (60 seconds) has not expired, the message is re‑enqueued with the lower priority.  
-- Otherwise, it is removed from the queue.
+The goal is to make collaboration self‑sustaining: nodes that actively relay messages earn points and get their own messages relayed faster, while passive or unknown nodes are gradually removed.
 
 ---
 
-### 🔄 Message return and reward (only the original author rewards)
+## 🧠 Detailed Description of the Operation
 
-After retransmission, the message may eventually return to the original node A.
+### 1. Creation and sending of a message (by the author)
 
-When A receives the message back, it verifies:  
-- The payload is the same (A stores it in `original_cache`)  
-- The timestamp is the same  
-- The signature now belongs to another node (e.g., B)  
+When node A creates a message, it performs the following steps:
 
-If these conditions are met:  
-1. A understands that B retransmitted its message  
-2. A checks the **credit window**: only **60 seconds after the first return** of this message are credits granted. After that, further returns are ignored.  
-3. A rewards B with points  
-
-**💰 Scoring rule**  
-The number of points is based on the message size (payload + timestamp + signature).  
-`Points = total_bytes // position`  
-where `position = 1` for the first return, `2` for the second, etc.  
-
-👉 **A node can earn points multiple times for the same message, but only within the 60‑second window.**  
-If the same node B returns the same payload again later (because it retransmitted it again), it will occupy the next free position in the return order and receive fewer points.  
-
-Example:  
-- Message size = 100 bytes.  
-- B returns first → position 1 → reward = 100 // 1 = 100 points.  
-- C returns second → position 2 → reward = 100 // 2 = 50 points.  
-- B returns third (again) → position 3 → reward = 100 // 3 = 33 points.  
-
-Thus, the earlier a node returns a message, the more points it gets, and the same node can collect multiple decreasing rewards over time (but only within 60 seconds).
+1. Generate a unique random `ID` (e.g., 10 digits).
+2. Calculate `hash = SHA‑256( content + ID )`.
+3. Store this hash in its **FIFO cache** (so it never processes its own message as a relay).
+4. Sign the string `content + ID` with its private key.
+5. Transmit via LoRa:  
+   `<content> <ID> <signature>`
+6. Add the hash to its **race list** (`active_races`), along with:
+   - `expire_time = now + 60 s`
+   - `ranking = []` (empty list of returner fingerprints)
+   - `total_bytes = len(content + ID + signature)`
 
 ---
 
-### 🏁 Multiple nodes retransmitting (e.g., B, C, D)
+### 2. Reception by another node (e.g., B)
 
-All nodes that ever retransmit the same message are eligible for rewards **when the message returns to the original creator**.  
-The **order of return** determines the reward: the first returner gets the highest reward, the second gets half, the third gets one third, etc.
+When node B receives a message, it runs the following pipeline:
 
-> **Important:** Only the original author gives credits. Intermediate nodes (like B) do **not** credit other nodes (e.g., D) when the message returns to B. This prevents self‑feeding loops and keeps the incentive clean.
+1. Extract `content`, `ID`, `signature`.
+2. Compute `hash = SHA‑256(content + ID)`.
+3. **Cache check** – if the hash is already in the local FIFO cache → discard (duplicate).
+4. **Signature verification** – try to verify the signature using the public keys B knows:
+   - Its own key (could be a return of its own message).
+   - The `trusted_keys` list.
+   - The `candidates` list.  
+   If no key matches → discard (unknown sender).
+5. **Add hash to cache** (prevents future duplicates).
+6. **Attempt decryption** (ECIES) if the content looks like an encrypted blob.
+   - If decryption succeeds → display as `🔒 [PRIVATE] from <fingerprint>: <plaintext>`
+   - Otherwise → display as `📢 [OPEN] from <fingerprint>: <content>`
+7. **Decision**:
+   - If B is the **original author** of this hash (hash is in its `active_races`) → handle as **return** (go to Section 3).
+   - Else if the sender is in `trusted_keys` → enqueue with **priority = sender’s points** (Section 4).
+   - Else if the sender is in `candidates` → enqueue with **fixed priority = 10** (Section 5).
 
 ---
 
-### 🔁 Chain propagation
+### 3. Message return and reward (only the original author)
 
-The message continues to propagate across the network:  
+When the original author A receives a message whose hash is in its `active_races` **and** the 60 s window has not expired:
 
-Example:  
-1. A sends → B receives  
-2. B signs and retransmits → D receives  
+1. Determine the return position:  
+   `place = len(ranking) + 1`  
+   (the same node can appear multiple times if it returns again later).
+2. Append the fingerprint of the signer to `ranking`.
+3. Calculate points:  
+   `points = total_bytes // place` (integer division, minimum 1).  
+   Examples for a 106‑byte message:  
+   - 1st return → 106 pts  
+   - 2nd return → 53 pts  
+   - 3rd return → 35 pts  
+   - 4th return → 26 pts, etc.
+4. Update `trusted_keys`: add the points to the signer’s record.
+5. If the signer was in `candidates`, **promote** it to `trusted_keys` and remove from `candidates`.
+6. The return message itself is **not retransmitted**.
 
-At this point:  
-- D sees the message signed by B, therefore D considers the message as coming from B (not A)  
-- D then repeats the same process:  
-  1. Verifies B’s public key  
-  2. Removes B’s signature  
-  3. Signs with its own key  
-  4. Retransmits  
+After 60 s, the hash is removed from `active_races` and no further returns are credited.
+
+---
+
+### 4. Messages from trusted nodes
+
+If the sender is in `trusted_keys`:
+
+- The message enters the **priority queue** with:
+  - `priority = current points of the sender` (from `trusted_keys`)
+  - `base = priority`
+  - `tx_count = 0`
+  - `born = monotonic timestamp`
+
+A separate thread (`retransmit_worker`) constantly processes the queue, always picking the item with the **highest priority**.
+
+For each item:
+1. Sign `content + ID` with the node’s **own** private key (the original signature is replaced).
+2. Transmit `<content> <ID> <new_signature>` via ESP32.
+3. Wait for the ESP32 confirmation (`OK`).  
+   - **Failure**: the item is re‑enqueued with the same priority.  
+   - **Success**:  
+     - `tx_count += 1`  
+     - `new_priority = base // (tx_count + 1)`  
+     - If `new_priority >= 1` **and** `now - born < 60 s`, re‑enqueue with `new_priority`.  
+     - Otherwise, discard the item.
+
+Thus, high‑reputation messages are relayed more often and survive longer in the queue, but every message decays and eventually expires.
+
+---
+
+### 5. Messages from candidates
+
+Candidates (nodes that sent an `invite` but never returned a message) receive a **fixed initial priority of 10**. The same decay and TTL rules apply. This gives them a small chance to prove themselves – if they return a message during its race window, they are promoted to `trusted_keys` and start accumulating real points.
+
+---
+
+### 6. Invitations and the `candidates` list
+
+- Any node can broadcast an invitation with the `invite` command.  
+  The invitation contains: `<public_key_base64> <signature_of_public_key>`.
+- Receiving nodes verify the self‑signature; if valid and the key is **not** in `trusted_keys`, they add the key to `candidates` (persisted in `candidates.json`).
+
+**Candidate expiry (purge):**
+
+- Every time the node sends a **normal message** (not an invite), it takes a snapshot of its current `candidates`.
+- After **60 seconds**, all candidates that are still in the list and were not promoted are **removed**.
+- Candidates added *after* the snapshot are safe – they will face expiry only when the next message is sent.
+
+This mechanism ensures that passive nodes that never relay anything are eventually forgotten, freeing resources.
+
+---
+
+### 7. Priority queue and decay summary
+
+| Origin | Initial priority | Decay formula | Max lifetime in queue |
+|--------|------------------|---------------|----------------------|
+| Trusted node | Points in `trusted_keys` | `base // (tx_count+1)` | 60 s |
+| Candidate | 10 | `10 // (tx_count+1)` | 60 s |
+
+The queue is capped at 10 MB; if it becomes full, the lowest‑priority messages are dropped.
 
 ---
 
 ### 🕵️ Anonymity of the original author
 
-Because each node **removes the previous signature** before adding its own, no intermediate node can trace the message back to the original creator.  
-- Everyone sees only the **last transmitter** (the node that signed the message they received).  
-- Only the original author and the intended recipient (if encryption is used) know who originated the message.  
-
-To the network, the author is a **ghost**.
-
----
-
-### ⏱️ Time rules
-
-To control propagation:  
-1. **Old messages** – If the timestamp is more than 20 minutes in the past → the message is **not** retransmitted  
-2. **Future messages** – If the timestamp is more than 10 minutes ahead of the node’s clock → the message is **not** retransmitted  
-
-Additionally, each message in the retransmission queue has a **maximum lifetime of 60 seconds** (TTL); after that, it is automatically discarded (even if its timestamp is still valid).
-
----
-
-### 🔐 End‑to‑end encryption (ECIES)
-
-GhostRelay now supports **private messages** using ECIES (Elliptic Curve Integrated Encryption Scheme).  
-
-- Contacts are stored in `contacts.json` with a name and the recipient’s public key (PEM or base64 DER).  
-- To send an encrypted message, use the syntax:  
-
-```
-
-<message>:<contact_name>
-
-```
-
-  Example: `Hello Alice:Alice`
-
-- The script automatically encrypts the message using ephemeral ECDH key + HKDF + AES‑256‑GCM.  
-- Every received message is silently attempted for decryption using our private key.  
-  - If decryption succeeds → displayed as `🔒 [PRIVATE] from <fingerprint>: <plaintext>`  
-  - Otherwise → displayed as `📢 [OPEN] from <fingerprint>: <content>`  
-
-Plaintext messages (without `:contact`) still work, but they ask for confirmation because they are visible to all nodes.
+Because each relaying node **replaces the signature** with its own, no intermediate node can trace the message back to the original creator. They only see the immediate predecessor. Only the original author (and the intended recipient, if encryption is used) know the true origin – hence the name **Ghost**Relay.
 
 ---
 
@@ -163,15 +157,12 @@ Plaintext messages (without `:contact`) still work, but they ask for confirmatio
 
 ### Prerequisites
 
-- **Python 3.8+** (recommended: 3.10 or higher)  
-- **pyserial**, **ecdsa**, **cryptography** – will be installed via `pip`  
-- For **USB** mode: a USB‑to‑TTL adapter or direct USB cable to your ESP32 (OTG cable for Android)  
-- For **Bluetooth** direct mode (optional): a paired Bluetooth serial adapter and proper permissions (root on Android, `rfcomm` on Linux)  
-- For **WiFi AP** mode: the ESP32 must be configured as an Access Point with a TCP server (firmware dependent).
+- **Python 3.8+** (3.10+ recommended)
+- **pyserial**, **ecdsa**, **cryptography** – installed via `pip`
+- USB‑to‑TTL adapter / direct USB cable (or Bluetooth / WiFi as described below)
+- ESP32 with LoRa module running a compatible AT‑firmware
 
 ### Get the code
-
-Clone the repository and enter the directory:
 
 ```bash
 git clone https://github.com/persev65-eng/GhostRelay-.git
@@ -184,7 +175,7 @@ Install dependencies
 pip install pyserial ecdsa cryptography
 ```
 
-On Termux (Android) you may need to install the pre‑compiled cryptography package:
+On Termux (Android) you may need:
 
 ```bash
 pkg install python-cryptography
@@ -193,10 +184,7 @@ pip install ecdsa pyserial
 
 Configure the connection (config.json)
 
-The file config.json defines how the script talks to your ESP32 (or any serial‑based radio).
-A default one is created automatically at first run. You can edit it manually.
-
-Basic options:
+A default config.json is created on first run. Edit it to match your setup:
 
 ```json
 {
@@ -214,12 +202,12 @@ Basic options:
 ```
 
 Mode connection_type Required fields Notes
-TCP (original) "tcp" tcp_host, tcp_port Uses a Bluetooth‑to‑TCP bridge app. Works everywhere without special permissions.
-USB serial "usb" usb_device, baudrate Direct cable connection. On Android you need OTG and termux-usb. On Linux add your user to dialout group.
-Bluetooth direct "bluetooth" bt_device (usually /dev/rfcomm0) Requires root on Android. On Linux: pair device, then rfcomm bind 0 <MAC>.
-WiFi AP "wifi_ap" wifi_ap_ip, wifi_ap_port, wifi_ap_ssid (info) Connect your computer/phone to the ESP32’s WiFi hotspot first. Then the script opens a TCP connection to the ESP32.
+TCP bridge "tcp" tcp_host, tcp_port Works everywhere without special permissions.
+USB serial "usb" usb_device, baudrate Direct cable. On Android use OTG + termux-usb.
+Bluetooth direct "bluetooth" bt_device (e.g., /dev/rfcomm0) Needs root on Android; on Linux pair and bind with rfcomm.
+WiFi AP "wifi_ap" wifi_ap_ip, wifi_ap_port Connect your PC/phone to the ESP32 hotspot first.
 
-Fallback – the script will try the modes in the order listed in fallback_order. If the primary mode fails, it moves to the next one automatically.
+The script tries the modes in fallback_order if the primary fails.
 
 Run the node
 
@@ -227,36 +215,40 @@ Run the node
 python3 relay.py
 ```
 
-The first execution will create all necessary files (private_key.pem, contacts.json, trusted_keys.json, etc.) and show you your public key.
+On first launch it generates your keys and shows your public key.
 
 ---
 
-Commands (once the node is running)
+📋 Commands (while the node is running)
 
 Command Description
-mykey Show your public key (share with others)
-addnode <name> <base64_key> Add a trusted relay node (its public key)
-addcontact <name> <base64_key> Add a contact for encrypted messaging
-contacts List all contacts
-credits View points earned from retransmissions
-queue See the retransmission queue (ordered by current priority)
-trusted List trusted relay nodes
-wifiscan List nearby WiFi networks (debug, helps find the ESP32 AP)
-<message>:<contact> Send an encrypted message to that contact
-<message> Send a plaintext message (asks confirmation)
-status, sf 9, freq 915, … Direct ESP32 commands (if supported by firmware)
-clear Clear screen
-Ctrl+C Stop the node
+mykey Show your public key (share with others).
+addnode <name> <base64_key> Add a trusted relay node manually.
+addcontact <name> <base64_key> Add a contact for encrypted messaging.
+contacts List all contacts.
+credits View your own points earned from retransmissions.
+queue Show the retransmission queue (priorities, decay, TTL).
+trusted List trusted nodes and their points.
+candidates Show current candidate nodes.
+clear_candidates Remove all candidates manually.
+invite Broadcast your invitation (public key + signature).
+<message>:<contact> Send an encrypted message to that contact.
+<message> Send a plaintext message (asks confirmation).
+status, bw, sf, freq, … Direct ESP32 commands (if supported).
+clear Clear screen.
+Ctrl+C Stop the node.
 
 ---
 
-Quick test (two nodes)
+🧪 Quick test (two nodes)
 
-1. Node A: run relay.py, type mykey, copy the Base64 DER line.
-2. Node B: run relay.py, type addnode NodeA <that_key>.
-3. Node A: type addnode NodeB <NodeB's_base64_key> (you can also add as contact for encryption: addcontact Bob <key>).
-4. Node B: send Hello Alice:Alice (if Alice is the contact name in B’s contacts.json) – it will be encrypted.
-5. Node A will receive and decrypt it automatically.
+1. Node A – run relay.py, type mykey, copy the Base64 DER line.
+2. Node B – run relay.py, type addnode NodeA <that_key>.
+3. Node A – type addnode NodeB <NodeB's_key> (optionally also addcontact Bob <key> for encryption).
+4. Node B – send Hello Alice:Alice (if Alice is a contact) → encrypted message.
+5. Node A receives and decrypts it automatically.
+
+Both nodes will now relay each other’s messages and accumulate points.
 
 ---
 
