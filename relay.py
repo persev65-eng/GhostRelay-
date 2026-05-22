@@ -2,22 +2,7 @@
 """
 GhostRelay - LoRa mesh relay with ECDSA signatures, ECIES encryption, credits,
 invite/candidates, race ranking, and independent expunge windows.
-
-This implementation follows the latest project logic as consistently as possible:
-- Each message is identified by content + 20-hex ID.
-- The author starts a 60s race for that hash and can credit returners.
-- Incoming packets are deduplicated with a FIFO hash cache (10k entries).
-- Invite packets are <pubkey_base64> <signature_base64> (no tx, no timestamp).
-- Candidates are persisted and have minimum relay priority.
-- Every normal send also starts an independent 60s candidate expunge window.
-- Trusted nodes keep accumulated points; candidates are promoted on return.
-- Transport fallback: WiFi AP / TCP / USB serial / Bluetooth RFCOMM serial.
-- ECIES private messages are supported via contacts.json.
-
-Note:
-The duplicate cache is applied when a packet is first processed as incoming traffic.
-That keeps author-side race credits working; if we inserted the hash into the same
-FIFO at send time, the author would never be able to count its own return.
+...
 """
 
 from __future__ import annotations
@@ -68,7 +53,7 @@ APP_DIR = Path.home() / "lora_relay"
 CONFIG_PATH = APP_DIR / "config.json"
 KEY_PATH = APP_DIR / "private_key.pem"
 TRUSTED_KEYS_PATH = APP_DIR / "trusted_keys.json"
-CREDITS_PATH = APP_DIR / "credits.json"  # mirror / backward compatibility
+CREDITS_PATH = APP_DIR / "credits.json"
 CONTACTS_PATH = APP_DIR / "contacts.json"
 CANDIDATES_PATH = APP_DIR / "candidates.json"
 HASH_CACHE_PATH = APP_DIR / "processed_hash_cache.txt"
@@ -299,11 +284,10 @@ credits_lock = threading.Lock()
 
 
 cache_lock = threading.Lock()
-processed_hash_cache = deque()  # FIFO of hashes already processed as incoming packets
+processed_hash_cache = deque()
 processed_hash_set: set[str] = set()
 
 def load_processed_hash_cache() -> None:
-    """Load FIFO hashes from the text file into RAM."""
     global processed_hash_cache, processed_hash_set
     with cache_lock:
         processed_hash_cache.clear()
@@ -328,7 +312,6 @@ def load_processed_hash_cache() -> None:
         log.warning("[CACHE] failed to load hash cache: %s", e)
 
 def save_processed_hash_cache() -> None:
-    """Persist the current FIFO cache to a plain text file, one hash per line."""
     with cache_lock:
         snap = list(processed_hash_cache)
     HASH_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -353,7 +336,6 @@ priority_queue: list = []
 current_buffer_bytes = 0
 relay_state: dict[str, RelayState] = {}
 
-# Confirmation queue for retransmissions
 confirm_event = threading.Event()
 
 # ----------------------------------------------------------------------------
@@ -398,7 +380,7 @@ def reload_trusted():
 def save_trusted():
     snap = _trusted_to_json()
     _save_atomic(TRUSTED_KEYS_PATH, snap)
-    _save_atomic(CREDITS_PATH, snap)  # backward-compatible mirror
+    _save_atomic(CREDITS_PATH, snap)
 
 
 def get_trusted() -> dict[str, TrustedEntry]:
@@ -661,13 +643,12 @@ def decrypt_message(content: str) -> Optional[str]:
         return None
 
 # ----------------------------------------------------------------------------
-# FIFO hash cache (inbound packet dedup)
+# FIFO hash cache
 # ----------------------------------------------------------------------------
 
 def cache_contains(h: str) -> bool:
     with cache_lock:
         return h in processed_hash_set
-
 
 
 def cache_add(h: str):
@@ -682,7 +663,7 @@ def cache_add(h: str):
     save_processed_hash_cache()
 
 # ----------------------------------------------------------------------------
-# Races (author-side score windows)
+# Races
 # ----------------------------------------------------------------------------
 
 def start_race(h: str, total_bytes: int):
@@ -692,7 +673,6 @@ def start_race(h: str, total_bytes: int):
 
 
 def handle_return(h: str, signer_fp: str, signer_vk: VerifyingKey) -> bool:
-    """True if the packet was a return of one of our own messages."""
     now = time.monotonic()
     with races_lock:
         race = active_races.get(h)
@@ -705,7 +685,6 @@ def handle_return(h: str, signer_fp: str, signer_vk: VerifyingKey) -> bool:
         race.ranking.append(signer_fp)
         total = race.total_bytes
         points = max(1, total // place)
-    # candidate promotion is independent of the expunge window; if it returned our message, promote
     if is_candidate(signer_fp):
         promote_candidate_to_trusted(signer_fp, points)
     else:
@@ -724,7 +703,7 @@ def race_watcher_thread():
                 del active_races[h]
 
 # ----------------------------------------------------------------------------
-# Expunge windows (candidate cleanup)
+# Expunge windows
 # ----------------------------------------------------------------------------
 
 def start_new_window(payload_hash: str):
@@ -752,7 +731,7 @@ def expunge_watcher_thread():
             log.info("[WINDOW] Expired payload=%s", w.payload_hash[:8])
 
 # ----------------------------------------------------------------------------
-# Signing / verification / invite verification
+# Signing / verification
 # ----------------------------------------------------------------------------
 
 def make_timestamp() -> str:
@@ -977,16 +956,6 @@ def process_invite(line: str) -> bool:
 # ----------------------------------------------------------------------------
 
 def handle_lora_packet(content: str) -> bool:
-    """
-    Parse a radio packet line.
-
-    Accepts either:
-      - "tx <content> <id> <signature>"
-      - "<content> <id> <signature>"
-
-    The content may contain spaces; the last two tokens are ID and signature.
-    Returns True only when the line was a valid radio packet and was consumed.
-    """
     parts = content.strip().split()
     if parts and parts[0].lower() == "tx":
         parts = parts[1:]
@@ -1008,16 +977,11 @@ def handle_lora_packet(content: str) -> bool:
     if signer_fp == MY_NODE_ID:
         return False
 
-    # If we've already seen this hash, it can only be a duplicate/loop.
-    # Keep the cache check local and cheap.
     if cache_contains(payload_hash):
-        # A return of our own message can still be handled by the race logic,
-        # but only if the packet was not already processed before.
         if handle_return(payload_hash, signer_fp, signer_vk):
             return True
         return False
 
-    # First successful processing as incoming traffic -> cache it.
     cache_add(payload_hash)
 
     decrypted = decrypt_message(msg_content)
@@ -1026,11 +990,9 @@ def handle_lora_packet(content: str) -> bool:
     else:
         print(f"\n📢 [OPEN]    de {signer_fp}: {msg_content}\n> ", end="", flush=True)
 
-    # If this is a return of our own message, credit/promote and stop here.
     if handle_return(payload_hash, signer_fp, signer_vk):
         return True
 
-    # Otherwise, relay according to sender type.
     if is_trusted(signer_fp):
         base_priority = max(1, get_trusted_points(signer_fp))
     elif is_candidate(signer_fp):
@@ -1045,8 +1007,6 @@ def handle_lora_packet(content: str) -> bool:
 def dispatch_line(line: str):
     raw = line.strip()
 
-    # The firmware prefixes many outgoing lines with "[ESP32] ".
-    # Normalize it first so invite / LoRa / confirmations still work.
     if raw.startswith("[ESP32] "):
         raw = raw[len("[ESP32] "):].strip()
 
@@ -1066,7 +1026,6 @@ def dispatch_line(line: str):
             print(f"[ESP32] {content}")
         return
 
-    # Some firmware builds emit raw invite / packet lines without [LoRa].
     if process_invite(raw):
         return
     if handle_lora_packet(raw):
@@ -1074,8 +1033,6 @@ def dispatch_line(line: str):
 
     print(f"[ESP32] {raw}")
 
-# ----------------------------------------------------------------------------
-# Commands
 # ----------------------------------------------------------------------------
 # Commands
 # ----------------------------------------------------------------------------
@@ -1097,21 +1054,39 @@ def cmd_credits():
     print("========================\n")
 
 
+def cmd_trusted():
+    with trusted_lock:
+        snap = sorted(_trusted.items(), key=lambda x: x[1].points, reverse=True)
+    print("\n=== TRUSTED NODES (points) ===")
+    if snap:
+        for fp, entry in snap:
+            print(f"  {fp} : {entry.points} pts")
+    else:
+        print("  (none)")
+    print(f"  MY ID : {MY_NODE_ID}")
+    print("=============================\n")
+
+
+def _queue_snapshot():
+    with queue_lock:
+        snap = [QueueItem.from_heap_tuple(t) for t in sorted(priority_queue)]
+        total = current_buffer_bytes
+    return snap, total
+
+
 def cmd_queue():
     now = time.monotonic()
-    with queue_lock:
-        if not priority_queue:
-            print("\n=== QUEUE empty ===\n")
-            return
-        snap = [QueueItem.from_heap_tuple(t) for t in sorted(priority_queue)]
-        total_bytes = current_buffer_bytes
-        state_snap = {h: (s.base, s.n_tx, s.born) for h, s in relay_state.items()}
-    print(f"\n=== QUEUE ({len(snap)} msgs · {total_bytes} bytes) ===")
+    snap, total = _queue_snapshot()
+    if not snap:
+        print("\n=== QUEUE empty ===\n")
+        return
+    print(f"\n=== QUEUE ({len(snap)} msgs · {total} bytes) ===")
     for i, item in enumerate(snap[:20]):
-        base, n_tx, born = state_snap.get(item.payload_hash, (item.base, item.n_tx, item.born))
-        ttl = max(0.0, QUEUE_TTL_SEC - (now - born))
-        prio = item.priority
-        print(f"  {i+1:2d}. prio={prio:4d} base={base:4d} tx={n_tx} ttl={ttl:4.0f}s origin={item.origin_fp} size={item.size}b hash={item.payload_hash[:8]}...")
+        ttl = max(0.0, QUEUE_TTL_SEC - (now - item.born))
+        print(
+            f"  {i+1:2d}. prio={item.priority:4d} base={item.base:4d} tx={item.n_tx} ttl={ttl:4.0f}s "
+            f"origin={item.origin_fp} size={item.size}b hash={item.payload_hash[:8]}..."
+        )
     print("============================================\n")
 
 
@@ -1271,7 +1246,6 @@ class SerialTransport(Transport):
     def connect(self):
         if not _SERIAL_AVAILABLE:
             raise ImportError("pyserial is not installed")
-        # exclusive=True helps avoid two processes grabbing the same tty on Linux.
         try:
             ser = serial.Serial(
                 port=self._device,
@@ -1280,10 +1254,8 @@ class SerialTransport(Transport):
                 exclusive=True,
             )
         except TypeError:
-            # Older pyserial versions may not support exclusive=
             ser = serial.Serial(port=self._device, baudrate=self._baudrate, timeout=SERIAL_READ_TIMEOUT)
 
-        # Many USB-serial boards reset on open; give the ESP32 time to boot.
         time.sleep(2.0)
         try:
             ser.reset_input_buffer()
@@ -1396,49 +1368,6 @@ class TransportManager:
         raise RuntimeError("All transports failed")
 
 # ----------------------------------------------------------------------------
-# Queue helpers
-# ----------------------------------------------------------------------------
-
-def _queue_snapshot():
-    with queue_lock:
-        snap = [QueueItem.from_heap_tuple(t) for t in sorted(priority_queue)]
-        total = current_buffer_bytes
-    return snap, total
-
-
-# ----------------------------------------------------------------------------
-# User command helpers
-# ----------------------------------------------------------------------------
-
-def cmd_trusted():
-    with trusted_lock:
-        snap = sorted(_trusted.items(), key=lambda x: x[1].points, reverse=True)
-    print("\n=== TRUSTED NODES (points) ===")
-    if snap:
-        for fp, entry in snap:
-            print(f"  {fp} : {entry.points} pts")
-    else:
-        print("  (none)")
-    print(f"  MY ID : {MY_NODE_ID}")
-    print("=============================\n")
-
-
-def cmd_queue():
-    now = time.monotonic()
-    snap, total = _queue_snapshot()
-    if not snap:
-        print("\n=== QUEUE empty ===\n")
-        return
-    print(f"\n=== QUEUE ({len(snap)} msgs · {total} bytes) ===")
-    for i, item in enumerate(snap[:20]):
-        ttl = max(0.0, QUEUE_TTL_SEC - (now - item.born))
-        print(
-            f"  {i+1:2d}. prio={item.priority:4d} base={item.base:4d} tx={item.n_tx} ttl={ttl:4.0f}s "
-            f"origin={item.origin_fp} size={item.size}b hash={item.payload_hash[:8]}..."
-        )
-    print("============================================\n")
-
-# ----------------------------------------------------------------------------
 # Input / stdin thread
 # ----------------------------------------------------------------------------
 
@@ -1494,132 +1423,22 @@ def send_normal_message(transport, text: str, encrypt_to: Optional[str] = None) 
         print(f"[ERROR] Send failed: {e}")
         return False
 
-    # Track the message locally so later loops are ignored.
-    # The race logic still allows valid returns to be credited.
     cache_add(payload_hash)
-
-    # The author tracks the message as an active race.
     start_race(payload_hash, total_bytes)
     start_new_window(payload_hash)
     return True
 
 # ----------------------------------------------------------------------------
-# Main packet handler / dispatch
-# ----------------------------------------------------------------------------
-
-def handle_lora_packet(content: str) -> bool:
-    """
-    Parse a radio packet line.
-
-    Accepts either:
-      - "tx <content> <id> <signature>"
-      - "<content> <id> <signature>"
-
-    The content may contain spaces; the last two tokens are ID and signature.
-    Returns True only when the line was a valid radio packet and was consumed.
-    """
-    parts = content.strip().split()
-    if parts and parts[0].lower() == "tx":
-        parts = parts[1:]
-    if len(parts) < 3:
-        return False
-
-    sig_b64 = parts[-1]
-    msg_id = parts[-2]
-    msg_content = " ".join(parts[:-2])
-
-    payload_for_sig = msg_content + msg_id
-    payload_hash = hashlib.sha256(payload_for_sig.encode("utf-8")).hexdigest()
-
-    result = identify_signer(payload_for_sig, sig_b64)
-    if result is None:
-        return False
-
-    signer_fp, signer_vk = result
-    if signer_fp == MY_NODE_ID:
-        return False
-
-    # If we've already seen this hash, it can only be a duplicate/loop.
-    # Keep the cache check local and cheap.
-    if cache_contains(payload_hash):
-        # A return of our own message can still be handled by the race logic,
-        # but only if the packet was not already processed before.
-        if handle_return(payload_hash, signer_fp, signer_vk):
-            return True
-        return False
-
-    # First successful processing as incoming traffic -> cache it.
-    cache_add(payload_hash)
-
-    decrypted = decrypt_message(msg_content)
-    if decrypted is not None:
-        print(f"\n🔒 [PRIVATE] de {signer_fp}: {decrypted}\n> ", end="", flush=True)
-    else:
-        print(f"\n📢 [OPEN]    de {signer_fp}: {msg_content}\n> ", end="", flush=True)
-
-    # If this is a return of our own message, credit/promote and stop here.
-    if handle_return(payload_hash, signer_fp, signer_vk):
-        return True
-
-    # Otherwise, relay according to sender type.
-    if is_trusted(signer_fp):
-        base_priority = max(1, get_trusted_points(signer_fp))
-    elif is_candidate(signer_fp):
-        base_priority = MIN_PRIORITY
-    else:
-        return False
-
-    enqueue_message(payload_hash, msg_content, msg_id, signer_fp, base_priority)
-    return True
-
-
-def dispatch_line(line: str):
-    raw = line.strip()
-
-    # The firmware prefixes many outgoing lines with "[ESP32] ".
-    # Normalize it first so invite / LoRa / confirmations still work.
-    if raw.startswith("[ESP32] "):
-        raw = raw[len("[ESP32] "):].strip()
-
-    if "[LoRa] OK" in raw:
-        confirm_event.set()
-        print(f"[ESP32] {line.strip()}")
-        return
-
-    if raw.startswith("[LoRa] "):
-        content = raw[len("[LoRa] "):].strip()
-        if content.startswith("tx "):
-            if handle_lora_packet(content[3:].strip()):
-                return
-        else:
-            if handle_lora_packet(content):
-                return
-            print(f"[ESP32] {content}")
-        return
-
-    # Some firmware builds emit raw invite / packet lines without [LoRa].
-    if process_invite(raw):
-        return
-    if handle_lora_packet(raw):
-        return
-
-    print(f"[ESP32] {raw}")
-
-# ----------------------------------------------------------------------------
-# Commands
-# ----------------------------------------------------------------------------
-# Background cleanup threads
+# Background cleanup
 # ----------------------------------------------------------------------------
 
 def cleanup_thread():
     while True:
         time.sleep(CACHE_CLEAN_INTERVAL)
         now = time.monotonic()
-        # Expire races
         with races_lock:
             for h in [h for h, r in active_races.items() if now > r.end]:
                 del active_races[h]
-        # Expire windows and remove still-candidates from their snapshot
         expired_windows = []
         with windows_lock:
             for h, w in list(active_windows.items()):
@@ -1630,13 +1449,12 @@ def cleanup_thread():
             for fp in list(w.snapshot):
                 if is_candidate(fp):
                     remove_candidate(fp)
-        # Save state periodically
         save_trusted()
         save_candidates()
         save_contacts()
 
 # ----------------------------------------------------------------------------
-# Main command loop
+# Main
 # ----------------------------------------------------------------------------
 
 def main():
@@ -1708,7 +1526,6 @@ def main():
             continue
 
         try:
-            # Give serial transports a short stabilization time after open/reset.
             if isinstance(transport, SerialTransport):
                 time.sleep(2.0)
                 try:
@@ -1723,7 +1540,6 @@ def main():
 
             connection_lost = False
             while not connection_lost:
-                # Drain network lines
                 while True:
                     try:
                         line = line_queue.get_nowait()
@@ -1737,7 +1553,6 @@ def main():
                 if connection_lost:
                     break
 
-                # Drain user commands
                 try:
                     cmd = stdin_queue.get_nowait()
                 except queue.Empty:
@@ -1825,7 +1640,6 @@ def main():
                         continue
 
                     if contact_name:
-                        # encrypted send is direct
                         ok = send_normal_message(transport, text, encrypt_to=contact_name)
                         if ok:
                             print(f"🔒 [SENT ENCRYPTED] to '{contact_name}'")
@@ -1855,6 +1669,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-load_hash_cache()
