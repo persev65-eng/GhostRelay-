@@ -69,12 +69,37 @@ O QUE FOI CORRIGIDO NESTA VERSÃO
 
 4) A chave privada era gravada com permissão padrão, legível por
    qualquer usuário da máquina. Agora é 0600.
+
+5) SEMENTE CORROMPIDA NO STORAGE ERA JOGADA FORA.
+
+   A proteção que guarda a chave ilegível para análise só existia para
+   o arquivo legado. Vindo do storage - que é o caminho preferido - a
+   semente era descartada e o arquivo sobrescrito na hora pela carteira
+   nova. Se desse para recuperar (um byte trocado, um arquivo
+   truncado), a chance se perdia ali, em silêncio.
+
+   Agora a semente ilegível é guardada antes de qualquer coisa, com
+   marca de tempo no nome, e o nó avisa em letras grandes que vai
+   trocar de identidade - porque isso significa perder toda a
+   reputação acumulada com os vizinhos.
+
+6) IDENTIDADE COM TIPO ERRADO NO STORAGE PASSAVA EM SILÊNCIO.
+
+   Se o storage devolvesse qualquer coisa que não fosse texto, a
+   função apenas desistia e o nó criava outra carteira sem dizer nada.
+
+7) exportar_semente() e importar_semente() não existiam.
+
+   Não havia como fazer backup da carteira nem restaurá-la. A chave
+   privada é a identidade econômica do nó: perder o disco era perder
+   tudo que os vizinhos tinham acumulado para ele.
 """
 
 
 import base64
 import os
 import stat
+import time
 
 try:
 
@@ -227,8 +252,21 @@ class GhostIdentity:
 
             return False
 
-        # o storage devolve {} quando não há nada gravado
-        if not saved or not isinstance(saved, str):
+        # nada gravado ainda: situação normal de primeiro boot
+        if saved is None or saved == {} or saved == "":
+
+            return False
+
+        # gravado, mas não é uma semente: também é perda de carteira,
+        # e antes isso passava em silêncio
+        if not isinstance(saved, str):
+
+            print("[IDENTITY] identidade no storage tem tipo inesperado:",
+                  type(saved).__name__)
+
+            self._preservar(repr(saved), "storage")
+
+            self._avisar_carteira_nova("storage")
 
             return False
 
@@ -264,13 +302,17 @@ class GhostIdentity:
         )
 
 
-    def _aplicar_semente(self, encoded, origem):
+    def _aplicar_semente(self, encoded, origem, preservar=True):
         """
         Converte a chave gravada em carteira utilizável.
 
         Chave corrompida não pode virar carteira nova em silêncio:
-        isso seria perder a identidade sem ninguém perceber. O arquivo
-        ruim é preservado com outro nome para análise.
+        isso seria perder a identidade sem ninguém perceber. A semente
+        ilegível é guardada ANTES de qualquer coisa, para dar chance de
+        recuperação.
+
+        preservar=False para importação manual: aí a semente ruim é a
+        que você digitou, e a carteira atual não tem culpa nenhuma.
         """
 
         try:
@@ -288,7 +330,11 @@ class GhostIdentity:
                 % (origem, len(raw), RAW_SEED_SIZE)
             )
 
-            self._preservar_chave_ruim()
+            if preservar:
+
+                self._preservar(encoded, origem)
+
+                self._avisar_carteira_nova(origem)
 
             return False
 
@@ -302,30 +348,98 @@ class GhostIdentity:
 
             print("[IDENTITY] falha ao abrir a carteira:", erro)
 
-            self._preservar_chave_ruim()
+            if preservar:
+
+                self._preservar(encoded, origem)
+
+                self._avisar_carteira_nova(origem)
 
             return False
 
         return True
 
 
-    def _preservar_chave_ruim(self):
+    def _preservar(self, conteudo, origem):
+        """
+        Guarda a semente ilegível antes de ela ser sobrescrita.
 
-        if not os.path.exists(self.key_file):
+        Antes isto só funcionava para o arquivo legado: semente
+        corrompida no storage era descartada e o arquivo era
+        sobrescrito na hora pela carteira nova. Se desse para
+        recuperar - um byte trocado, um arquivo truncado - a chance
+        se perdia ali.
+        """
 
-            return
+        marca = time.strftime("%Y%m%d-%H%M%S")
 
-        destino = self.key_file + ".invalido"
+        # veio do storage
+        if origem == "storage" and self.storage:
 
-        try:
+            nome = "identity_corrompida_%s" % marca
 
-            os.replace(self.key_file, destino)
+            try:
 
-            print("[IDENTITY] chave ilegivel movida para", destino)
+                self.storage.save(nome, conteudo)
 
-        except OSError:
+                print("[IDENTITY] semente ilegivel guardada em",
+                      self.storage.path(nome))
 
-            pass
+                return self.storage.path(nome)
+
+            except Exception as erro:
+
+                print("[IDENTITY] nao consegui guardar a semente:", erro)
+
+        # veio do arquivo legado
+        if os.path.exists(self.key_file):
+
+            # com a marca de tempo no nome, uma segunda corrupção não
+            # apaga o backup da primeira
+            destino = "%s.corrompido-%s" % (self.key_file, marca)
+
+            try:
+
+                os.replace(self.key_file, destino)
+
+                print("[IDENTITY] chave ilegivel movida para", destino)
+
+                return destino
+
+            except OSError:
+
+                pass
+
+        return None
+
+
+    def _avisar_carteira_nova(self, origem):
+        """
+        Trocar de carteira não é detalhe: é o nó deixando de ser quem
+        era para todos os vizinhos.
+        """
+
+        print("""
+==================================================
+ ATENCAO: A CARTEIRA VAI SER SUBSTITUIDA
+==================================================
+ A carteira anterior nao pode ser lida (%s).
+ A semente ilegivel foi guardada ao lado.
+
+ O no vai subir com OUTRA identidade. Isso quer dizer:
+
+   - os pontos que os vizinhos acumularam para ele
+     deixam de valer
+   - ele volta a ser um vizinho desconhecido
+     (secoes 18 e 19)
+   - precisa mandar convite e ser promovido de novo
+
+ Se voce tem um backup da semente, encerre o no e
+ restaure antes de continuar:
+
+     no = GhostIdentity()
+     no.importar_semente("<semente em base64>")
+==================================================
+""" % origem)
 
 
     # =================================================
@@ -440,6 +554,53 @@ class GhostIdentity:
             return True
 
         return self._load_from_file()
+
+
+    # =================================================
+    # BACKUP DA CARTEIRA
+    # =================================================
+
+    def exportar_semente(self):
+        """
+        A semente em base64. É a carteira INTEIRA: quem tem isto é o nó.
+
+        Guarde fora da máquina se a reputação do nó importa - é a única
+        forma de recuperar a identidade depois de um disco perdido ou de
+        um arquivo corrompido.
+        """
+
+        return base64.b64encode(
+
+            bytes(self.private_key)
+
+        ).decode()
+
+
+    def importar_semente(self, semente):
+        """
+        Substitui a carteira atual pela semente informada e grava.
+
+        Devolve False sem tocar em nada se a semente for inválida: a
+        culpa seria do texto digitado, não da carteira que está lá.
+        """
+
+        anterior = self.private_key
+
+        if not self._aplicar_semente(semente, "importacao", preservar=False):
+
+            self.private_key = anterior
+
+            self.public_key = anterior.verify_key if anterior else None
+
+            print("[IDENTITY] semente invalida; a carteira atual foi mantida")
+
+            return False
+
+        self.save_wallet()
+
+        print("[IDENTITY] carteira restaurada:", self.get_short_id())
+
+        return True
 
 
     # =================================================
@@ -877,10 +1038,35 @@ if __name__ == "__main__":
           GhostIdentity.find_signer(message, "A" * 88, lista))
 
 
-    try:
+    print("\nBACKUP DA CARTEIRA:")
 
-        os.remove("teste_outro_no.key")
+    semente = node.exportar_semente()
 
-    except OSError:
+    print("  semente:", semente[:24] + "...")
 
-        pass
+    copia = GhostIdentity(key_file="teste_restaurada.key")
+
+    print("  carteira nova   :", copia.get_short_id())
+
+    copia.importar_semente(semente)
+
+    print("  apos restaurar  :", copia.get_short_id())
+
+    print("  e a mesma do original?",
+          copia.get_public_key() == node.get_public_key())
+
+    print("  semente invalida e recusada:",
+          copia.importar_semente("nao_e_uma_semente") is False)
+
+    print("  carteira preservada apos a recusa?",
+          copia.get_public_key() == node.get_public_key())
+
+    for lixo in ("teste_outro_no.key", "teste_restaurada.key"):
+
+        try:
+
+            os.remove(lixo)
+
+        except OSError:
+
+            pass

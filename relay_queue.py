@@ -76,6 +76,27 @@ O QUE FOI CORRIGIDO NESTA VERSÃO
    TRANSMISSÃO, concorrendo com o laço do próprio MAC. Continuam aqui
    para compatibilidade, mas com aviso: use um OU outro.
 
+6) O RÁDIO NÃO ACOMPANHAVA O PACOTE.
+
+   Registrar a mesma mensagem de novo atualizava a prioridade e o
+   pacote, mas deixava SF/BW/CR como estavam. O pacote e os parâmetros
+   são uma coisa só - ele foi assinado para ir ao ar NAQUELA
+   configuração. Uma mensagem ouvida duas vezes em configurações
+   diferentes ia ao ar na primeira, contra a seção 21.
+
+7) A PRIORIDADE PODIA CAIR DUAS VEZES POR TRANSMISSÃO.
+
+   Com attach_mac() e mac.attach_relay_queue() ligados ao mesmo tempo,
+   os dois lados chamavam mark_transmitted(). Agora transmit_next()
+   percebe que o MAC já desconta e não desconta de novo.
+
+8) get_next() ENTREGAVA O ITEM VIVO.
+
+   Transmitir leva segundos em SF12, e nesse tempo a mesma mensagem
+   pode ser registrada de novo com outro pacote. Quem está
+   transmitindo não pode ver o item mudar debaixo dele. Agora sai uma
+   cópia.
+
 
 SOBRE PERSISTÊNCIA
 ------------------
@@ -172,6 +193,14 @@ class RelayQueue:
 
         self.mac = mac
 
+        if getattr(mac, "relay_queue", None) is self:
+
+            print("[FILA] atencao: esta fila ja esta ligada ao MAC pelo")
+
+            print("       outro lado (mac.attach_relay_queue). Com os dois")
+
+            print("       caminhos ativos, duas threads disputam a serial.")
+
 
 
     def transmit_next(
@@ -203,6 +232,11 @@ class RelayQueue:
 
 
 
+        # O MAC corrigido desconta a prioridade sozinho quando a fila
+        # está ligada nele. Descontar aqui também derrubaria a
+        # prioridade duas vezes por transmissão.
+        mac_ja_desconta = getattr(self.mac, "relay_queue", None) is self
+
         try:
 
 
@@ -211,7 +245,7 @@ class RelayQueue:
             )
 
 
-            if resultado:
+            if resultado and not mac_ja_desconta:
 
 
                 self.mark_transmitted(
@@ -267,11 +301,23 @@ class RelayQueue:
         da mensagem original (seção 21).
 
         Uma mensagem ocupa UMA posição. Se o hash já estiver na fila,
-        fica valendo a maior prioridade entre as duas e o pacote é
-        atualizado - o conteúdo é o mesmo, só a assinatura é mais nova.
+        fica valendo a maior prioridade entre as duas, e o pacote e os
+        SF/BW/CR são atualizados JUNTOS - o conteúdo é o mesmo, só a
+        assinatura é mais nova.
         """
 
         if not msg_hash or not packet:
+
+            return None
+
+        try:
+
+            prioridade = float(priority)
+
+        except (TypeError, ValueError):
+
+            print("[FILA] prioridade invalida, item recusado:",
+                  str(msg_hash)[:12])
 
             return None
 
@@ -296,11 +342,23 @@ class RelayQueue:
 
                     existente["priority"],
 
-                    float(priority)
+                    prioridade
 
                 )
 
+                # O pacote e os parâmetros de rádio são uma coisa só: o
+                # pacote foi assinado para ir ao ar NAQUELA configuração.
+                # Antes só o pacote era atualizado, e uma mensagem ouvida
+                # duas vezes em configurações diferentes ia ao ar na
+                # primeira - transmitindo em SF/BW/CR que não são os que
+                # ela foi escutada, contra a seção 21.
                 existente["packet"] = packet
+
+                existente["sf"] = radio["sf"]
+
+                existente["bw"] = radio["bw"]
+
+                existente["cr"] = radio["cr"]
 
                 return existente
 
@@ -313,7 +371,7 @@ class RelayQueue:
 
                 "type": msg_type,
 
-                "priority": float(priority),
+                "priority": prioridade,
 
                 "sf": radio["sf"],
 
@@ -399,6 +457,11 @@ class RelayQueue:
 
         NÃO remove da fila: a mensagem só sai por FIFO (seções 11 e 23).
         Entre prioridades iguais vence a mais antiga.
+
+        Devolve uma cópia. Transmitir leva segundos em SF12, e nesse
+        tempo a mensagem pode ser registrada de novo com outro pacote:
+        quem está transmitindo não pode ver o item mudar debaixo dele.
+        Para alterar a fila, use mark_transmitted() ou remove().
         """
 
         with self.lock:
@@ -409,7 +472,7 @@ class RelayQueue:
 
 
 
-            return max(
+            escolhido = max(
 
                 self.queue.values(),
 
@@ -417,6 +480,8 @@ class RelayQueue:
                 x["priority"]
 
             )
+
+            return dict(escolhido)
 
 
 
@@ -673,9 +738,10 @@ if __name__ == "__main__":
 
         relay.mark_transmitted(proxima["hash"])
 
+        atual = relay.get(proxima["hash"])
+
         print("  transmitiu %s -> prioridade agora %7.2f | continua na fila: %s"
-              % (proxima["hash"], proxima["priority"],
-                 relay.get(proxima["hash"]) is not None))
+              % (proxima["hash"], atual["priority"], atual is not None))
 
     print("\n  ordem de saida agora:")
 
@@ -693,6 +759,21 @@ if __name__ == "__main__":
     print("  registrar HASH_A de novo com prioridade 900")
     print("  itens na fila:", relay.size())
     print("  prioridade de HASH_A agora:", relay.get("HASH_A")["priority"])
+
+    print("\n" + "=" * 58)
+    print(" O RÁDIO ACOMPANHA O PACOTE (seção 21)")
+    print("=" * 58)
+
+    print("  HASH_A foi registrado em SF12/BW250/CR4:7 ->",
+          relay.get_radio_config("HASH_A"))
+
+    relay.add("MSG_A_OUTRO_SF", "HASH_A", 900, sf=9, bw=125, cr=5)
+
+    print("  ouvida de novo em SF9/BW125/CR4:5        ->",
+          relay.get_radio_config("HASH_A"))
+
+    print("  pacote acompanhou?",
+          relay.get("HASH_A")["packet"] == "MSG_A_OUTRO_SF")
 
     print("\n" + "=" * 58)
     print(" SEÇÃO 23 - FIFO")

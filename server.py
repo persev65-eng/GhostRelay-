@@ -90,6 +90,34 @@ O QUE FOI CORRIGIDO NESTA VERSÃO
 
 7) HTTPServer atende um cliente por vez, e a página não se reconectava
    quando o nó reiniciava.
+
+8) O CONTADOR DA PÁGINA CONTAVA CARACTERES; O LIMITE É EM BYTES.
+
+   maxlength="164" no navegador, mas "ç" ocupa 2 bytes e um emoji
+   ocupa 4: 120 caracteres acentuados são 240 bytes. O texto passava
+   pelo navegador e era recusado pelo nó. Agora a conta é em bytes,
+   com os caracteres entre parênteses quando os dois números diferem,
+   e o limite passa a vir do próprio nó pelo status.
+
+9) A ROTA /rx LIA A FILA SEM LOCK.
+
+   list(app_rx_queue.queue) enquanto outra thread escrevia nela.
+
+10) ERRO DE SERIALIZAÇÃO SUMIA DENTRO DE UM FUTURE.
+
+   json.dumps acontecia dentro da corotina agendada; se o objeto não
+   fosse serializável, a exceção ficava guardada num Future que
+   ninguém lê e a mensagem simplesmente não chegava na tela, sem
+   nenhuma pista. Agora a serialização é feita na thread que chama.
+
+11) FILA DE ENVIO CHEIA ERA SÓ UMA LINHA NO CONSOLE.
+
+   Quem mandou a mensagem via a tela parada sem saber que ela tinha
+   sido descartada. Agora o cliente recebe o aviso.
+
+12) PORTA HTTP OCUPADA VIRAVA TRACEBACK SOLTO NUMA THREAD,
+
+   e a página nunca subia, sem explicação.
 """
 
 
@@ -122,8 +150,13 @@ MAX_TX_FILA = 500
 MAX_RX_FILA = 500
 
 
-# Limite de texto por mensagem, informado pelo main.py.
+# Limite de texto por mensagem, em BYTES.
 # 255 bytes do pacote LoRa - 88 de assinatura - 3 do marcador <0>.
+#
+# Bytes, não caracteres: "ç" ocupa 2 bytes, "ã" ocupa 2, um emoji
+# ocupa 4. O rádio transmite bytes, e é por byte que o pacote estoura.
+# Quando o nó informa o limite dele no status, a página passa a usar
+# esse valor em vez deste.
 LIMITE_TEXTO = 164
 
 
@@ -293,11 +326,24 @@ def publicar(dado):
 
         return
 
+    # Serializa aqui, na thread que chamou: dentro da corotina o erro
+    # ficaria guardado num Future que ninguém lê, e a mensagem
+    # simplesmente não apareceria na tela sem nenhuma pista.
+    try:
+
+        texto = json.dumps(dado)
+
+    except (TypeError, ValueError) as erro:
+
+        print("[SERVER] objeto impossivel de serializar:", erro)
+
+        return
+
     try:
 
         asyncio.run_coroutine_threadsafe(
 
-            enviar_websocket(dado),
+            _transmitir(texto),
 
             loop_global
 
@@ -306,6 +352,22 @@ def publicar(dado):
     except RuntimeError:
 
         pass
+
+
+async def _transmitir(texto):
+    """
+    Envia um texto já pronto para todos os clientes.
+    """
+
+    for cliente in list(clientes):
+
+        try:
+
+            await cliente.send(texto)
+
+        except Exception:
+
+            clientes.discard(cliente)
 
 
 
@@ -318,24 +380,9 @@ async def enviar_websocket(dado):
     if not clientes:
         return
 
-    texto = json.dumps(dado)
-
-    removidos = []
-
     # list(): o conjunto pode mudar durante o await se outro cliente
     # conectar ou cair no meio do envio
-    for cliente in list(clientes):
-
-        try:
-            await cliente.send(texto)
-
-        except Exception:
-            removidos.append(cliente)
-
-
-    for cliente in removidos:
-
-        clientes.discard(cliente)
+    await _transmitir(json.dumps(dado))
 
 
 
@@ -391,7 +438,9 @@ async def tratar_mensagem(ws, bruto):
         # texto puro: é uma mensagem para a rede
         print("APP TX:", str(bruto)[:60])
 
-        receber_aplicacao(bruto)
+        if not receber_aplicacao(bruto):
+
+            await _avisar_fila_cheia(ws)
 
         return
 
@@ -423,8 +472,31 @@ async def tratar_mensagem(ws, bruto):
 
     print("APP TX:", str(dados)[:60])
 
-    receber_aplicacao(dados)
+    if not receber_aplicacao(dados):
 
+        await _avisar_fila_cheia(ws)
+
+
+
+async def _avisar_fila_cheia(ws):
+    """
+    Fila de envio cheia era só uma linha no console do nó: quem mandou
+    a mensagem via a tela parada, sem saber que ela foi descartada.
+    """
+
+    try:
+
+        await ws.send(json.dumps({
+
+            "tipo": "erro",
+
+            "dados": "fila de envio cheia; a mensagem foi descartada"
+
+        }))
+
+    except Exception:
+
+        pass
 
 
 # =====================================================
@@ -468,17 +540,21 @@ HTML = """<!doctype html>
 <div class="estado" id="estado">conectando...</div>
 
 <div class="linha">
-  <input id="msg" placeholder="mensagem para a rede" autocomplete="off" maxlength="164">
+  <input id="msg" placeholder="mensagem para a rede" autocomplete="off">
   <button onclick="enviar()">enviar</button>
   <button onclick="comando('convite')">convite</button>
   <button onclick="comando('status')">status</button>
 </div>
-<div class="contador" id="contador">0 / 164 caracteres</div>
+<div class="contador" id="contador">0 / 164 bytes</div>
 
 <div id="log"></div>
 
 <script>
-const LIMITE = 164;
+// medido em BYTES: acento ocupa 2, emoji ocupa 4. O maxlength do
+// navegador conta caracteres, entao nao serve aqui - "ç" x120 passaria
+// nele e seria recusado pelo no. O valor e atualizado pelo status.
+let LIMITE = 164;
+const bytes = (s) => new TextEncoder().encode(s).length;
 let ws, log = document.getElementById('log'), campo = document.getElementById('msg');
 
 function escrever(classe, texto, meta){
@@ -528,6 +604,7 @@ function conectar(){
 }
 
 function mostrarStatus(d){
+  if (d.limite_texto) { LIMITE = d.limite_texto; atualizarContador(); }
   document.getElementById('estado').innerHTML =
     'carteira <b>' + (d.carteira || '?') + '</b>' +
     ' | conhecidos <b>' + (d.conhecidos || 0) + '</b>' +
@@ -541,9 +618,10 @@ function mostrarStatus(d){
 function enviar(){
   const texto = campo.value.trim();
   if (!texto || !ws || ws.readyState !== 1) return;
-  if (texto.length > LIMITE) {
-    escrever('err', 'ERRO  mensagem tem ' + texto.length +
-             ' caracteres; o maximo por pacote e ' + LIMITE);
+  const n = bytes(texto);
+  if (n > LIMITE) {
+    escrever('err', 'ERRO  mensagem tem ' + n + ' bytes (' + texto.length +
+             ' caracteres); o maximo por pacote e ' + LIMITE + ' bytes');
     return;
   }
   ws.send(JSON.stringify({tipo:'tx', dados:texto}));
@@ -557,10 +635,11 @@ function comando(t){
 }
 
 function atualizarContador(){
-  const n = campo.value.length;
+  const n = bytes(campo.value);
   const c = document.getElementById('contador');
-  c.textContent = n + ' / ' + LIMITE + ' caracteres';
-  c.className = 'contador' + (n >= LIMITE ? ' cheio' : '');
+  c.textContent = n + ' / ' + LIMITE + ' bytes';
+  if (n !== campo.value.length) c.textContent += '  (' + campo.value.length + ' caracteres)';
+  c.className = 'contador' + (n > LIMITE ? ' cheio' : '');
 }
 
 campo.addEventListener('input', atualizarContador);
@@ -578,7 +657,13 @@ class Pagina(BaseHTTPRequestHandler):
 
         if self.path.startswith("/rx"):
 
-            corpo = json.dumps(list(app_rx_queue.queue)[-100:]).encode()
+            # o deque interno e mexido por outra thread enquanto esta
+            # rota le; queue.Queue expoe o proprio mutex para isso
+            with app_rx_queue.mutex:
+
+                historico = list(app_rx_queue.queue)[-100:]
+
+            corpo = json.dumps(historico).encode()
 
             tipo = "application/json"
 
@@ -630,13 +715,25 @@ def iniciar_http():
 
     # ThreadingHTTPServer: o HTTPServer simples atende um cliente por
     # vez, e uma aba aberta segurava a página para as outras
-    servidor = ThreadingHTTPServer(
-        (
-            "0.0.0.0",
-            HTTP_PORT
-        ),
-        Pagina
-    )
+    try:
+
+        servidor = ThreadingHTTPServer(
+            (
+                "0.0.0.0",
+                HTTP_PORT
+            ),
+            Pagina
+        )
+
+    except OSError as erro:
+
+        # antes isto virava um traceback solto numa thread e a página
+        # simplesmente nunca subia
+        print("[HTTP] nao consegui abrir a porta %d: %s" % (HTTP_PORT, erro))
+
+        print("       ja existe outro no rodando nesta maquina?")
+
+        return
 
     print(
         f"Pagina: http://localhost:{HTTP_PORT}"

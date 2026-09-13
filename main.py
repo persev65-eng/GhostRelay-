@@ -84,6 +84,21 @@ O QUE FOI CORRIGIDO NESTA VERSÃO
 7) O laço principal ficava até 1 segundo parado em mac_events.get(),
    e mensagens da aplicação esperavam essa volta inteira.
 
+8) UMA MENSAGEM IMPOSSÍVEL DE TRANSMITIR TRAVAVA O NÓ INTEIRO.
+
+   Quando o rádio não consegue aplicar o SF/BW/CR de uma mensagem, a
+   transmissão é cancelada (seção 21). Só que falha não desconta
+   prioridade - a seção 11 só desconta quando transmite. Resultado: a
+   mensagem ficava eternamente no topo da fila, o MAC escolhia,
+   falhava, escolhia de novo, e o nó parava de transmitir qualquer
+   outra coisa.
+
+   Medido com o firmware antigo: uma única mensagem nessa situação
+   levou a vazão do nó a ZERO pacote no ar. Agora ela sai da fila e,
+   se for própria, a aplicação é avisada.
+
+9) CONVITE IGNORADO NÃO ENTRAVA NA CONTA DE DESCARTADOS.
+
 
 RETRANSMISSÃO REPETIDA (seções 10 e 11)
 ---------------------------------------
@@ -686,11 +701,23 @@ class GhostRelayNode:
 
         if tipo == "TX_DONE":
 
-            tempo = event.get("time_ms")
+            # O valor da mensagem foi decidido quando ela entrou na
+            # lista corrida e não muda mais. Aqui é só log: consulta o
+            # que já está guardado em vez de medir a transmissão de
+            # novo a cada envio.
+            entrada = self.race.find(event.get("hash")) if self.race else None
 
-            pontos = self.economy.calculate_points(tempo)
+            if entrada:
 
-            print("TX FINALIZADO: %.0f pontos de antena" % pontos)
+                print("TX FINALIZADO: %s | vale %.0f pontos"
+                      " | proxima posicao %.0f"
+                      % (str(event.get("hash"))[:12],
+                         entrada["initial_points"],
+                         entrada["current_points"]))
+
+            else:
+
+                print("TX FINALIZADO:", str(event.get("hash"))[:12])
 
             self.depois_da_transmissao(event.get("hash"))
 
@@ -700,7 +727,7 @@ class GhostRelayNode:
 
         elif tipo == "TX_FAILED":
 
-            print("TX FALHOU:", event.get("motivo"))
+            self.tx_falhou(event.get("hash"), event.get("motivo") or "")
 
         # -------------------------
         # RX FINALIZADO
@@ -709,6 +736,67 @@ class GhostRelayNode:
         elif tipo == "RX_DONE":
 
             self.processar_pacote_recebido(event)
+
+    def tx_falhou(self, msg_hash, motivo):
+        """
+        A transmissão não aconteceu. Há dois casos bem diferentes.
+
+        TEMPORÁRIO (rádio não confirmou, canal, timeout): a mensagem
+        fica na fila e será tentada de novo. É o certo: nada mudou
+        sobre ela.
+
+        DEFINITIVO (o rádio não consegue aplicar o SF/BW/CR dela): esta
+        mensagem NUNCA vai poder ser transmitida por este nó. E como
+        falha não desconta prioridade (seção 11 só desconta quando
+        transmite), ela ficaria eternamente no topo da fila: o MAC
+        escolhe, falha, escolhe de novo. O nó para de transmitir
+        qualquer outra coisa.
+
+        Medido: com o firmware antigo, uma única mensagem nessa
+        situação derrubou a vazão do nó para ZERO pacote no ar.
+        """
+
+        print("TX FALHOU:", motivo)
+
+        if not msg_hash:
+
+            return
+
+        if "SF/BW/CR" not in motivo:
+
+            # temporário: continua na fila para nova tentativa
+            return
+
+        if self.queue:
+
+            self.queue.remove(msg_hash)
+
+        propria = False
+
+        if self.race:
+
+            entrada = self.race.find(msg_hash)
+
+            propria = bool(entrada and entrada.get("own"))
+
+        print("  mensagem %s removida da fila: o radio nao consegue"
+              % msg_hash[:12])
+
+        print("  transmitir com o SF/BW/CR dela (secao 21).")
+
+        print("  Grave o firmware corrigido para casar os parametros.")
+
+        if propria:
+
+            self.entregar_para_app({
+
+                "tipo": "erro",
+
+                "dados": ("sua mensagem nao pode ser transmitida: o radio "
+                          "nao consegue aplicar o SF/BW/CR dela (secao 21)")
+
+            })
+
 
     def depois_da_transmissao(self, msg_hash):
         """
@@ -753,7 +841,12 @@ class GhostRelayNode:
 
         radio = event.get("radio") or self.radio_padrao()
 
-        tempo = event.get("time_ms") or 0
+        # O tempo de antena NÃO é calculado aqui. A maior parte dos
+        # pacotes que chegam não precisa dele: duplicata é descartada
+        # pelo cache, retorno é pago com o valor que JÁ está na lista
+        # corrida, assinatura desconhecida é descartada. Ele é
+        # calculado uma única vez, lá no passo 8, quando a mensagem
+        # realmente vai virar prioridade e valor.
 
         if not self.messages:
 
@@ -778,7 +871,7 @@ class GhostRelayNode:
 
             return self.tratar_convite(
 
-                conteudo, assinatura, msg_hash, radio, tempo
+                conteudo, assinatura, msg_hash
 
             )
 
@@ -817,6 +910,21 @@ class GhostRelayNode:
         self.cache.add(msg_hash)
 
         # ---- 8: prioridade (seções 17 e 20) -------------------------
+        #
+        # Único ponto em que o tempo de antena desta mensagem é medido.
+        # O mesmo número serve para a prioridade (seções 17 e 20) e
+        # para o valor na lista corrida (seção 8), porque 1 ms = 1
+        # ponto. Depois disto ele nunca mais é recalculado: quem manda
+        # é o valor guardado na corrida, caindo pela metade a cada
+        # retorno (seção 10).
+        tempo = self.economy.message_time_ms(
+
+            pacote,
+
+            radio["sf"], radio["bw"], radio["cr"]
+
+        )
+
         tipo_vizinho = self.neighbors.get_type(dono) if self.neighbors else None
 
         if tipo_vizinho == "trusted":
@@ -851,13 +959,11 @@ class GhostRelayNode:
         # ---- 10: entrar na lista corrida (seção 20, item 6) ---------
         if CORRIDA_RETRANSMITIDAS:
 
-            pontos = self.economy.message_points(
-
-                relay["packet"], radio["sf"], radio["bw"], radio["cr"]
-
-            )
-
-            self.registrar_corrida(msg_hash, pontos, radio, propria=False)
+            # 1 ms = 1 ponto: é o mesmo número do passo 8. O pacote que
+            # eu vou transmitir tem exatamente o tamanho do que chegou
+            # (mesmo conteúdo, mesma assinatura de 88 caracteres), então
+            # não há o que recalcular.
+            self.registrar_corrida(msg_hash, tempo, radio, propria=False)
 
         # ---- 11: enfileirar com os MESMOS SF/BW/CR (seção 21) -------
         self.enfileirar(
@@ -903,7 +1009,7 @@ class GhostRelayNode:
     # CONVITE RECEBIDO (seção 18)
     # =================================================
 
-    def tratar_convite(self, chave, assinatura, msg_hash, radio, tempo):
+    def tratar_convite(self, chave, assinatura, msg_hash):
         """
         Seções 12 e 18.
 
@@ -931,6 +1037,13 @@ class GhostRelayNode:
         if registrado:
 
             print("NOVO VIZINHO DESCONHECIDO:", chave[:12])
+
+            return
+
+        # convite de carteira já conhecida, ou minha própria de volta:
+        # nada a fazer, mas a conta de descartados precisa fechar com
+        # o que realmente chegou no rádio
+        self.stats["descartados"] += 1
 
     # =================================================
     # RECOMPENSA (seções 10, 19 e 21)
@@ -1113,7 +1226,15 @@ class GhostRelayNode:
 
             })
 
+        if self.messages:
+
+            # a página usa isto no contador; sem ele ela fica com o
+            # valor fixo dela, que pode divergir do nó
+            dados["limite_texto"] = self.messages.max_content_size()
+
         dados.update({
+
+            "convites_rx": self.stats["convites_rx"],
 
             "recebidos": self.stats["recebidos"],
 

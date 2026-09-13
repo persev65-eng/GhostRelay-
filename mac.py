@@ -159,17 +159,29 @@ TICK = 0.001
 
 BACKOFF_START = 50.0    # ms
 
-BACKOFF_MIN = 5.0       # ms - piso, senão a janela vira zero
+# A janela NÃO tem teto. A seção 3.3 dobra a cada transmissão
+# bem-sucedida justamente para frear quem fala demais: um nó sozinho
+# na rede vai de 50 ms a minutos em ~15 transmissões e a horas em ~20,
+# calando-se por conta própria. Basta ouvir um vizinho para a janela
+# cair pela metade e ele voltar a falar. Um teto desligava esse freio.
 
-BACKOFF_MAX = 1600.0    # ms - teto, senão o nó dobra até nunca mais falar
+# O piso é a resolução da própria contagem: abaixo de um tique não há
+# sorteio nenhum a fazer, e com janela zero random.uniform(0, 0) devolve
+# sempre 0 - o nó transmitiria sem esperar, e a seção 3.2 deixaria de
+# existir. Coloque 0 aqui para seguir o documento ao pé da letra.
+BACKOFF_MIN = TICK * 1000.0    # ms
 
 
-# Tempos limite
-TIMEOUT_TX = 30.0        # s  (SF12/BW250 com 255 bytes leva ~6 s no ar)
+# Tempos limite da conversa com o firmware.
+# Não há prazo para esperar o canal liberar: a seção 3.4 manda esperar
+# a transmissão terminar, e ponto.
 TIMEOUT_RADIO = 10.0     # s  esperando o rádio ficar pronto
-TIMEOUT_CANAL = 15.0     # s  esperando o canal liberar
 TIMEOUT_CAD = 2.0        # s  resposta do comando CAD
 TIMEOUT_CONFIG = 3.0     # s  resposta do comando de configuração
+
+# Piso do prazo de confirmação de TX. O prazo real é calculado a partir
+# do tempo de antena do pacote, que depende de tamanho, SF, BW e CR.
+TIMEOUT_TX_MINIMO = 10.0     # s
 
 
 # Limite de payload do LoRa
@@ -281,6 +293,27 @@ def _formatar_bw(bw):
     bw = float(bw)
 
     return str(int(bw)) if bw == int(bw) else str(bw)
+
+
+def _tempo_legivel(ms):
+    """
+    A janela pode chegar a horas quando o nó fala sozinho por muito
+    tempo (seção 3.3). Em milissegundos isso vira um número ilegível.
+    """
+
+    if ms < 1000:
+
+        return "%.1f ms" % ms
+
+    if ms < 60000:
+
+        return "%.1f s" % (ms / 1000.0)
+
+    if ms < 3600000:
+
+        return "%.1f min" % (ms / 60000.0)
+
+    return "%.1f h" % (ms / 3600000.0)
 
 
 def _numero(texto):
@@ -447,10 +480,17 @@ class Radio:
 
             raise
 
-        # abrir a serial reinicia o ESP32 (DTR): espera o boot
-        time.sleep(3)
-
-        # Limpa mensagens antigas do boot do ESP32
+        # Limpa o que estava no buffer ANTES de abrir a porta.
+        #
+        # BUG ANTIGO: aqui havia time.sleep(3) e só DEPOIS o
+        # reset_input_buffer(). Abrir a porta reinicia o ESP32 pelo DTR,
+        # e ele manda BOOT, READY, CAPS e RX_STARTED por volta de 1,5 s
+        # - ou seja, a limpeza jogava fora exatamente as mensagens de
+        # boot. O nó ficava 10 segundos em "sem resposta; tentando
+        # acordar" e nunca via o anúncio de capacidades do firmware.
+        #
+        # Agora a limpeza é imediata e a thread leitora, que sobe logo
+        # abaixo, captura o boot enquanto ele acontece.
         self.ser.reset_input_buffer()
 
         # ------------- estado (antes eram globais que se perdiam) -----
@@ -462,6 +502,13 @@ class Radio:
 
         self.config_ok = threading.Event()
 
+        # o firmware respondeu que a configuração é inválida
+        self.config_erro = threading.Event()
+
+        # uma recepção terminou (pacote decodificado, CRC errado ou
+        # descartado). É o sinal de "a transmissão do vizinho acabou".
+        self.fim_recepcao = threading.Event()
+
         # seção 3.2: ouvimos uma transmissão que deu para decodificar
         self.transmissao_valida = threading.Event()
 
@@ -471,11 +518,18 @@ class Radio:
 
         self.suporta_config = None
 
+        self.suporta_set_cr = None
+
+        self.capacidades = None        # o que o firmware anunciou
+
         self.avisou_cr = False
 
         self.ultimo_rssi = None
 
         self.ultimo_snr = None
+
+        # linhas ilegiveis descartadas (bootloader da ROM, ruido)
+        self.lixo = 0
 
         self.escrita_lock = threading.Lock()
 
@@ -541,6 +595,15 @@ class Radio:
 
                 continue
 
+            # O ESP32 solta o texto do bootloader da ROM em outro baud
+            # quando reinicia; lido a 115200 vira lixo ilegivel. Antes
+            # isso ia direto para o log e enchia a tela de simbolos.
+            if not self._nossa(linha):
+
+                self.lixo += 1
+
+                continue
+
             # O firmware ecoa todo comando recebido. Sem ignorar o eco,
             # "EVENT:CMD_RECEIVED:RX_START" era lido como evento de
             # verdade por qualquer parser que usasse "in".
@@ -561,6 +624,23 @@ class Radio:
                 print("[RADIO] erro ao tratar linha:", erro)
 
     # -----------------------------------------------------------------
+    # campos soltos que o STATUS devolve
+    CAMPOS_STATUS = ("FREQ:", "BW:", "SF:", "CR:", "POWER:", "RX:",
+                     "SPI:", "RADIO:")
+
+
+    def _nossa(self, linha):
+        """
+        A linha veio do nosso firmware?
+        """
+
+        if linha.startswith(("EVENT:", "MSG:")):
+
+            return True
+
+        return linha.startswith(self.CAMPOS_STATUS)
+
+
     def _tratar_linha(self, linha):
 
         if linha.startswith("MSG:"):
@@ -587,11 +667,36 @@ class Radio:
 
             self.config_ok.set()
 
+        elif evento.startswith("CONFIG_ERROR"):
+
+            # o firmware TEM o comando e recusou o valor. Antes isto
+            # era ignorado e o MAC esperava os 3 s de timeout como se
+            # o comando não existisse.
+            print("[RADIO] configuracao recusada:", linha)
+
+            self.config_erro.set()
+
+        elif evento.startswith("CAPS:"):
+
+            self._registrar_capacidades(evento[5:])
+
         elif evento == "BOOT":
 
             print("[RADIO] o ESP32 reiniciou")
 
             self.pronto.clear()
+
+        elif evento.startswith("RADIO_RESET"):
+
+            print("[RADIO] o radio travou e esta sendo reinicializado")
+
+            print("        se isto se repetir, suspeite da alimentacao:")
+
+            print("        22 dBm puxa picos de centenas de mA")
+
+        elif evento == "RX_RETRY":
+
+            pass
 
         elif evento == "RX":
 
@@ -599,10 +704,18 @@ class Radio:
             # É só isso que faz o nó perder a disputa.
             self.transmissao_valida.set()
 
+            self.fim_recepcao.set()
+
         elif evento in ("CRC_ERROR", "RX_CRC_ERROR"):
 
-            # seção 3.3: colisão é IGNORADA, a contagem continua
-            pass
+            # seção 3.3: colisão é IGNORADA, a contagem continua.
+            # Mas ela marca o FIM de uma recepção: o canal acabou de
+            # liberar, e é isso que a espera do canal precisa saber.
+            self.fim_recepcao.set()
+
+        elif evento.startswith("RX_DISCARDED"):
+
+            self.fim_recepcao.set()
 
         elif evento == "TX_OK":
 
@@ -622,6 +735,8 @@ class Radio:
 
         elif evento.startswith("CAD_UNSUPPORTED"):
 
+            print("[RADIO] o firmware nao conseguiu fazer CAD:", linha)
+
             self.suporta_cad = False
 
             self.cad_resposta.put(True)
@@ -639,6 +754,45 @@ class Radio:
             print("[RADIO] FALHA:", linha)
 
     # -----------------------------------------------------------------
+    def _registrar_capacidades(self, lista):
+        """
+        O firmware corrigido anuncia o que sabe fazer no boot:
+
+            EVENT:CAPS:CONFIG,CAD,SET_SF,SET_BW,SET_CR,SET_FREQ,PING
+
+        Sem isso o MAC descobria por tentativa e erro: mandava CONFIG,
+        esperava 3 s, desistia; mandava SET_CR, esperava mais 3 s,
+        desistia - e repetia a cada mensagem com CR diferente.
+        """
+
+        self.capacidades = {
+
+            c.strip().upper()
+
+            for c in str(lista).split(",")
+
+            if c.strip()
+
+        }
+
+        self.suporta_config = "CONFIG" in self.capacidades
+
+        self.suporta_cad = "CAD" in self.capacidades
+
+        self.suporta_set_cr = "SET_CR" in self.capacidades
+
+        print("[RADIO] firmware anuncia:",
+              ", ".join(sorted(self.capacidades)))
+
+        if not self.suporta_cad:
+
+            print("[RADIO] sem CAD: nao ha escuta antes de transmitir")
+
+        if not self.suporta_set_cr:
+
+            print("[RADIO] sem SET_CR: mensagem com outro CR nao sai")
+
+
     def _separar_metadados(self, corpo):
         """
         O firmware novo manda MSG:<pacote>|SF=..|BW=..|RSSI=..
@@ -694,16 +848,20 @@ class Radio:
 
         snr = meta.get("snr", self.ultimo_snr)
 
-        # seção 8: tempo de antena calculado, não cronometrado
-        tempo = self.tempo_no_ar(pacote, radio)
-
+        # O tempo de antena NÃO é medido aqui.
+        #
+        # A maior parte dos pacotes que chegam não precisa dele:
+        # duplicata morre no cache, retorno é pago com o valor que já
+        # está na lista corrida, assinatura desconhecida é descartada.
+        # Quem precisa do número é a camada de cima, e ela calcula uma
+        # vez só, no momento em que a mensagem vira prioridade e valor.
         evento = {
 
             "type": "RX_DONE",
 
             "packet": pacote,
 
-            "time_ms": tempo,
+            "bytes": len(pacote.encode("utf-8")),
 
             "radio": radio,
 
@@ -735,33 +893,18 @@ class Radio:
                 pass
 
     # -----------------------------------------------------------------
-    @staticmethod
-    def tempo_no_ar(pacote, radio):
-        """
-        Seção 8 - quanto tempo esse pacote ocupa o rádio.
+    # tempo_no_ar() foi removido daqui.
+    #
+    # O MAC não mede mais o valor econômico de nada: esse número é
+    # decidido uma única vez, quando a mensagem entra na lista corrida
+    # (seção 8), e depois só cai pela metade a cada retorno (seção 10).
+    # Medir a cada transmissão era recalcular o que já estava guardado.
+    #
+    # O que sobrou de cálculo de tempo aqui embaixo é outra coisa:
+    # prazo de confirmação de TX e quanto esperar por uma recepção em
+    # curso. São temporizações de rádio, não economia.
 
-        Calculado pelo economy.py. Cronômetro de PC mediria serial mais
-        ar e nunca fecharia a mesma conta nos dois nós, o que tornaria a
-        seção 21 impossível de verificar.
-        """
 
-        if not GhostEconomy:
-
-            return None
-
-        return GhostEconomy.message_time_ms(
-
-            pacote,
-
-            radio["sf"],
-
-            radio["bw"],
-
-            radio["cr"]
-
-        )
-
-    # -----------------------------------------------------------------
     def esperar_pronto(self, timeout=TIMEOUT_RADIO):
 
         if self.pronto.wait(timeout):
@@ -813,9 +956,43 @@ class Radio:
 
         return self._tentar_set(alvo)
 
+    def _esperar_resposta_config(self, timeout=TIMEOUT_CONFIG):
+        """
+        Três respostas possíveis, e elas são bem diferentes:
+
+            True  - aplicou
+            False - o firmware TEM o comando e recusou o valor
+            None  - ninguém respondeu: o comando não existe neste
+                    firmware
+
+        Antes só existia "respondeu ou não respondeu", e um valor
+        recusado era confundido com comando inexistente.
+        """
+
+        fim = time.monotonic() + timeout
+
+        while time.monotonic() < fim:
+
+            if self.config_ok.wait(0.05):
+
+                return True
+
+            if self.config_erro.is_set():
+
+                return False
+
+            if encerrar.is_set():
+
+                return None
+
+        return None
+
+
     def _tentar_config(self, alvo):
 
         self.config_ok.clear()
+
+        self.config_erro.clear()
 
         self.enviar("CONFIG SF=%d BW=%s CR=%d" % (
 
@@ -823,7 +1000,9 @@ class Radio:
 
         ))
 
-        if self.config_ok.wait(TIMEOUT_CONFIG):
+        resposta = self._esperar_resposta_config()
+
+        if resposta is True:
 
             self.suporta_config = True
 
@@ -832,6 +1011,14 @@ class Radio:
             self.iniciar_rx()
 
             return True
+
+        if resposta is False:
+
+            # o comando existe; o valor é que não serve. Não adianta
+            # tentar os SET_*, e o firmware continua tendo CONFIG.
+            self.suporta_config = True
+
+            return False
 
         if self.suporta_config is None:
 
@@ -847,15 +1034,16 @@ class Radio:
 
         if self.radio_config["sf"] != alvo["sf"]:
 
-            ok = self._set("SET_SF %d" % alvo["sf"]) and ok
+            ok = (self._set("SET_SF %d" % alvo["sf"]) is True) and ok
 
         if abs(self.radio_config["bw"] - alvo["bw"]) >= 0.01:
 
-            ok = self._set("SET_BW %s" % _formatar_bw(alvo["bw"])) and ok
+            ok = (self._set("SET_BW %s"
+                            % _formatar_bw(alvo["bw"])) is True) and ok
 
         if self.radio_config["cr"] != alvo["cr"]:
 
-            if not self._set("SET_CR %d" % alvo["cr"]):
+            if not self._trocar_cr(alvo["cr"]):
 
                 # o firmware antigo não tem SET_CR: o CR fica diferente
                 # do original e a recompensa da seção 21 não sai
@@ -885,13 +1073,51 @@ class Radio:
 
         return ok
 
+    def _trocar_cr(self, cr):
+        """
+        Uma vez descoberto que o firmware não tem SET_CR, não adianta
+        insistir: eram 3 segundos parados A CADA mensagem com CR
+        diferente, e com o cancelamento da seção 21 isso derrubava a
+        vazão do nó.
+        """
+
+        if self.suporta_set_cr is False:
+
+            return False
+
+        resposta = self._set("SET_CR %d" % cr)
+
+        if resposta is True:
+
+            self.suporta_set_cr = True
+
+            return True
+
+        if resposta is False:
+
+            # o comando existe, o valor é que não serve
+            self.suporta_set_cr = True
+
+            return False
+
+        # ninguém respondeu: este firmware não tem SET_CR
+        self.suporta_set_cr = False
+
+        return False
+
+
     def _set(self, comando):
+        """
+        Devolve True/False/None como _esperar_resposta_config.
+        """
 
         self.config_ok.clear()
 
+        self.config_erro.clear()
+
         self.enviar(comando)
 
-        return self.config_ok.wait(TIMEOUT_CONFIG)
+        return self._esperar_resposta_config()
 
     def restaurar_escuta(self):
         """
@@ -926,7 +1152,15 @@ class Radio:
 
             resposta = self.cad_resposta.get(timeout=TIMEOUT_CAD)
 
-            self.suporta_cad = True
+            # BUG ANTIGO: aqui havia "self.suporta_cad = True" sem
+            # condição. O tratador de CAD_UNSUPPORTED acabava de marcar
+            # False e empurrar "livre" na fila, e esta linha desfazia o
+            # False. Resultado: o nó perguntava para sempre e tomava
+            # todo canal ocupado como livre - a escuta da seção 3.1
+            # desligada em silêncio.
+            if self.suporta_cad is None:
+
+                self.suporta_cad = True
 
             return resposta
 
@@ -945,6 +1179,60 @@ class Radio:
             return True
 
     # -----------------------------------------------------------------
+    def tempo_maximo_de_pacote(self):
+        """
+        Quanto tempo o maior pacote possível ocupa o ar na configuração
+        atual. É o teto de quanto vale a pena esperar por uma recepção
+        em curso antes de conferir o canal de novo.
+
+        SF7/BW250: 0,3 s   |   SF12/BW250: 6,2 s
+        """
+
+        if not GhostEconomy:
+
+            return 10.0
+
+        tempo = GhostEconomy.airtime_ms(
+
+            MAX_PAYLOAD,
+
+            self.radio_config["sf"],
+
+            self.radio_config["bw"],
+
+            self.radio_config["cr"]
+
+        ) / 1000.0
+
+        return max(1.0, tempo + 1.0)
+
+
+    def prazo_de_tx(self, payload):
+        """
+        Quanto esperar pela confirmação: o tempo de antena do pacote
+        com margem. Antes era um número fixo de 30 s, que é curto para
+        um pacote grande em SF12 e longo demais para SF7.
+        """
+
+        if not GhostEconomy:
+
+            return 60.0
+
+        tempo = GhostEconomy.message_time_ms(
+
+            payload,
+
+            self.radio_config["sf"],
+
+            self.radio_config["bw"],
+
+            self.radio_config["cr"]
+
+        ) / 1000.0
+
+        return max(TIMEOUT_TX_MINIMO, tempo * 3 + 5.0)
+
+
     def transmitir_payload(self, payload):
         """
         Manda o pacote e espera a confirmação do firmware.
@@ -975,7 +1263,7 @@ class Radio:
 
             return False
 
-        limite = time.monotonic() + TIMEOUT_TX
+        limite = time.monotonic() + self.prazo_de_tx(payload)
 
         while time.monotonic() < limite:
 
@@ -1006,7 +1294,7 @@ class Radio:
 
         return mac_events.get(timeout=timeout)
 
-    def esperar_tx(self, timeout=TIMEOUT_TX):
+    def esperar_tx(self, timeout=60.0):
         """
         Mantido para compatibilidade com quem já chamava.
         """
@@ -1076,14 +1364,9 @@ class GhostRelayMAC:
 
             return False
 
-        resultado = self.transmitir(pacote)
-
-        if resultado:
-
-            # seção 11: transmitiu, prioridade cai pela metade
-            self.relay_queue.mark_transmitted(pacote["hash"])
-
-        return resultado
+        # quem desconta a prioridade é o _concluir_tx, logo antes de
+        # publicar o TX_DONE, para as duas coisas saírem na ordem certa
+        return self.transmitir(pacote)
 
     # ===============================
     # ESPERA RADIO PRONTO
@@ -1099,13 +1382,14 @@ class GhostRelayMAC:
 
     def sucesso_tx(self):
 
-        self.backoff_time = min(self.backoff_time * 2, BACKOFF_MAX)
+        # sem teto: quem fala cede espaço e fica cada vez mais paciente
+        self.backoff_time *= 2
 
         self.transmissoes += 1
 
         print("TX SUCESSO")
 
-        print("NOVO BACKOFF:", round(self.backoff_time, 1), "ms")
+        print("NOVO BACKOFF:", _tempo_legivel(self.backoff_time))
 
     # ===============================
     # PERDEU DISPUTA (seção 3.3)
@@ -1119,25 +1403,62 @@ class GhostRelayMAC:
 
         print("PERDEU DISPUTA")
 
-        print("NOVO BACKOFF:", round(self.backoff_time, 1), "ms")
+        print("NOVO BACKOFF:", _tempo_legivel(self.backoff_time))
 
     # ===============================
     # ESPERAR O CANAL LIBERAR (seções 3.1 e 3.4)
     # ===============================
 
     def esperar_canal_livre(self):
+        """
+        Seção 3.4, passo 2: "se o canal está ocupado, espera a
+        transmissão terminar".
 
-        limite = time.monotonic() + TIMEOUT_CANAL
+        Sem prazo. Antes havia um limite de 15 segundos e, passado ele,
+        o nó transmitia por cima de quem já estava no ar - exatamente o
+        que a seção 3.1 existe para evitar. Falar por cima não adianta
+        nada: os dois pacotes se perdem.
 
-        while time.monotonic() < limite and not encerrar.is_set():
+        Só desiste quando o nó está encerrando.
+        """
+
+        inicio = time.monotonic()
+
+        avisou = False
+
+        while not encerrar.is_set():
 
             if self.radio.canal_livre():
 
+                if avisou:
+
+                    print("[MAC] canal liberou apos %.0f s"
+                          % (time.monotonic() - inicio))
+
                 return True
 
-            time.sleep(0.05)
+            if not avisou:
 
-        print("[MAC] canal ocupado tempo demais; seguindo mesmo assim")
+                print("[MAC] canal ocupado; esperando liberar (secao 3.1)")
+
+                avisou = True
+
+            # BUG ANTIGO: aqui havia time.sleep(0.05), ou seja, um CAD
+            # a cada 50 ms. Cada CAD tira o rádio da escuta (standby ->
+            # scan -> startReceive) por dezenas de milissegundos; em
+            # SF12 o nó passava perto de metade do tempo surdo, e o
+            # preâmbulo que ele estava esperando dura 131 ms. Ele
+            # perdia justamente a transmissão que estava esperando.
+            #
+            # Agora ele fica ESCUTANDO e espera o sinal de que uma
+            # recepção terminou. Só então pergunta de novo.
+            self.radio.fim_recepcao.clear()
+
+            self.radio.fim_recepcao.wait(
+
+                self.radio.tempo_maximo_de_pacote()
+
+            )
 
         return False
 
@@ -1185,7 +1506,11 @@ class GhostRelayMAC:
 
         while not encerrar.is_set():
 
-            self.esperar_canal_livre()
+            # antes o retorno era ignorado: o nó seguia para o backoff
+            # mesmo com o canal ocupado
+            if not self.esperar_canal_livre():
+
+                return False
 
             if self.executar_backoff():
 
@@ -1207,15 +1532,7 @@ class GhostRelayMAC:
 
             print("PACOTE SEM CONFIGURAÇÃO DE RÁDIO")
 
-            publicar_evento({
-
-                "type": "TX_FAILED",
-
-                "hash": pacote.get("hash"),
-
-                "motivo": "sem SF/BW/CR"
-
-            })
+            self._falhou(pacote, "sem SF/BW/CR")
 
             return False
 
@@ -1231,46 +1548,103 @@ class GhostRelayMAC:
 
                 return False
 
-            # seção 21: os mesmos SF/BW/CR com que a mensagem foi ouvida
-            if not self.radio.configurar(pacote):
+            sucesso = False
 
-                print("[MAC] nao consegui casar os parametros de radio")
+            radio_usado = None
 
-            if not self.disputar_canal():
+            try:
 
-                return False
+                # Seção 21 - os mesmos SF/BW/CR com que a mensagem foi
+                # escutada. "Deve OBRIGATORIAMENTE": se o rádio não
+                # aceitar a configuração, a transmissão não acontece.
+                #
+                # Antes o nó avisava e transmitia assim mesmo, gastando
+                # segundos de antena numa transmissão que o autor não
+                # vai pagar e jogando pacote numa configuração onde
+                # ninguém o espera.
+                if not self.radio.configurar(pacote):
 
-            print("TRANSMITINDO:", pacote["packet"][:40],
-                  "..." if len(pacote["packet"]) > 40 else "")
+                    print("[MAC] SF/BW/CR da mensagem nao puderam ser")
 
-            sucesso = self.radio.transmitir_payload(pacote["packet"])
+                    print("      aplicados; transmitir com outra config")
 
-            radio_usado = self.radio.get_radio_status()
+                    print("      quebraria a secao 21. Cancelado.")
 
-            # volta a escutar no SF do nó
-            self.radio.restaurar_escuta()
+                    self._falhou(pacote, "SF/BW/CR nao aplicaveis")
+
+                    return False
+
+                if not self.disputar_canal():
+
+                    return False
+
+                print("TRANSMITINDO:", pacote["packet"][:40],
+                      "..." if len(pacote["packet"]) > 40 else "")
+
+                sucesso = self.radio.transmitir_payload(pacote["packet"])
+
+                radio_usado = self.radio.get_radio_status()
+
+            finally:
+
+                # O rádio escuta um SF por vez. Sair daqui sem voltar
+                # para a configuração de escuta deixa o nó surdo para
+                # os vizinhos - e antes isso acontecia em toda saída
+                # que não fosse o caminho feliz.
+                self.radio.restaurar_escuta()
 
         if not sucesso:
 
             print("TX FALHOU")
 
-            publicar_evento({
-
-                "type": "TX_FAILED",
-
-                "hash": pacote.get("hash"),
-
-                "motivo": "sem confirmacao do radio"
-
-            })
-
-            enviar_server({"type": "TX_FAILED", "hash": pacote.get("hash")})
+            self._falhou(pacote, "sem confirmacao do radio")
 
             return False
 
         print("TX FINALIZADO")
 
         self.sucesso_tx()
+
+        self._concluir_tx(pacote, radio_usado)
+
+        return True
+
+
+    def _falhou(self, pacote, motivo):
+
+        publicar_evento({
+
+            "type": "TX_FAILED",
+
+            "hash": pacote.get("hash"),
+
+            "motivo": motivo
+
+        })
+
+        enviar_server({
+
+            "type": "TX_FAILED",
+
+            "hash": pacote.get("hash"),
+
+            "motivo": motivo
+
+        })
+
+
+    def _concluir_tx(self, pacote, radio_usado):
+        """
+        Seção 11 - a prioridade cai pela metade ANTES de avisar as
+        camadas de cima.
+
+        Antes o evento TX_DONE era publicado primeiro, e quem o
+        recebesse lia a prioridade ainda sem a divisão.
+        """
+
+        if self.relay_queue and pacote.get("hash"):
+
+            self.relay_queue.mark_transmitted(pacote["hash"])
 
         publicar_evento({
 
@@ -1280,7 +1654,11 @@ class GhostRelayMAC:
 
             "packet": pacote["packet"],
 
-            "time_ms": Radio.tempo_no_ar(pacote["packet"], radio_usado),
+            # sem tempo de antena: o valor da mensagem foi decidido
+            # quando ela entrou na lista corrida (seção 8) e não muda
+            # mais. Medir a cada transmissão seria recalcular o que já
+            # está guardado.
+            "bytes": len(pacote["packet"].encode("utf-8")),
 
             "radio": radio_usado
 
@@ -1288,7 +1666,6 @@ class GhostRelayMAC:
 
         enviar_server({"type": "TX_DONE", "hash": pacote.get("hash")})
 
-        return True
 
     # ===============================
     # LOOP PRINCIPAL
