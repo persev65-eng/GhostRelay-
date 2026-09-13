@@ -1,266 +1,502 @@
-# GhostRelay
-
-Hello everyone from the Mesh networking community,
-
-I have been working for a few months on a project aiming to create a decentralized means of communication. The proposal is to develop a system where the network nodes themselves collaborate in message retransmission, using cryptographic signatures and an incentive mechanism based on message return.
-
-Below is the detailed explanation of the system logic. The complete script and installation instructions are available in this repository – clone or download it to join the network.
+# GhostRelay — Message Protocol, Phantom Retransmission, and Economic Incentive
 
 ---
 
-## 📡 Overview
+## 📦 Modules Used
 
-GhostRelay is a **reputation‑based mesh relay protocol** for low‑bandwidth LoRa networks (ESP32). Every node maintains:
-
-- A **FIFO cache** (default 10 000 entries) to avoid processing the same message more than once.
-- A **trusted_keys list** of nodes that have already proven useful, along with their accumulated points.
-- A **candidates list** of nodes that sent an `invite` but have not yet returned any message.
-- A **priority queue** for retransmission – messages from high‑reputation nodes go out first, and the priority decays with each hop.
-- A **race window** (60 s) during which the original author awards points to anyone who returns the message.
-
-The goal is to make collaboration self‑sustaining: nodes that actively relay messages earn points and get their own messages relayed faster, while passive or unknown nodes are gradually removed.
+| Component | Model |
+| :--- | :--- |
+| **Microcontroller** | ESP32 DevKit V1 (DOIT) — ESP32-D0WD-V3 |
+| **Radio Module** | Ebyte E80-900M2212S(LR2021) — Semtech LR2021 Chip |
 
 ---
 
-## 🧠 Detailed Description of the Operation
+## 📡 Pinout Used
 
-### 1. Creation and sending of a message (by the author)
-
-When node A creates a message, it performs the following steps:
-
-1. Generate a unique random `ID` (e.g., 10 digits).
-2. Calculate `hash = SHA‑256( content + ID )`.
-3. Store this hash in its **FIFO cache** (so it never processes its own message as a relay).
-4. Sign the string `content + ID` with its private key.
-5. Transmit via LoRa:  
-   `<content> <ID> <signature>`
-6. Add the hash to its **race list** (`active_races`), along with:
-   - `expire_time = now + 60 s`
-   - `ranking = []` (empty list of returner fingerprints)
-   - `total_bytes = len(content + ID + signature)`
-
----
-
-### 2. Reception by another node (e.g., B)
-
-When node B receives a message, it runs the following pipeline:
-
-1. Extract `content`, `ID`, `signature`.
-2. Compute `hash = SHA‑256(content + ID)`.
-3. **Cache check** – if the hash is already in the local FIFO cache → discard (duplicate).
-4. **Signature verification** – try to verify the signature using the public keys B knows:
-   - Its own key (could be a return of its own message).
-   - The `trusted_keys` list.
-   - The `candidates` list.  
-   If no key matches → discard (unknown sender).
-5. **Add hash to cache** (prevents future duplicates).
-6. **Attempt decryption** (ECIES) if the content looks like an encrypted blob.
-   - If decryption succeeds → display as `🔒 [PRIVATE] from <fingerprint>: <plaintext>`
-   - Otherwise → display as `📢 [OPEN] from <fingerprint>: <content>`
-7. **Decision**:
-   - If B is the **original author** of this hash (hash is in its `active_races`) → handle as **return** (go to Section 3).
-   - Else if the sender is in `trusted_keys` → enqueue with **priority = sender’s points** (Section 4).
-   - Else if the sender is in `candidates` → enqueue with **fixed priority = 10** (Section 5).
+| Pin on E80-900M2212S(LR2021) | ESP32 Pin | Actual GPIO | Function |
+| :--- | :--- | :--- | :--- |
+| **GND** | GND | — | Ground |
+| **VCC** | 3.3V | — | Power |
+| **MISO** | D19 | GPIO19 | SPI — Master In Slave Out |
+| **MOSI** | D23 | GPIO23 | SPI — Master Out Slave In |
+| **SCK** | D18 | GPIO18 | SPI — Clock |
+| **NSS** | D5 | GPIO5 | SPI — Chip Select |
+| **BUSY** | D4 | GPIO4 | Busy signal |
+| **LR_NRESET** | D21 | GPIO21 | Module reset |
+| **DIO5** | D33 | GPIO33 | TX/RX interrupt |
+| **DIO6** | D32 | GPIO32 | CAD interrupt |
+| **DIO7** | D26 | GPIO26 | Reserve |
+| **DIO8** | D27 | GPIO27 | Reserve |
+| **DIO9** | D13 | GPIO13 | Reserve |
+| **DIO10** | D25 | GPIO25 | Reserve |
+| **DIO11** | D22 | GPIO22 | Reserve |
+| **ANT_SUBGHZ** | *(physical antenna)* | — | Sub-GHz antenna (868/915 MHz) |
+| **ANT_2.4G** | *(physical antenna)* | — | 2.4 GHz antenna |
 
 ---
 
-### 3. Message return and reward (only the original author)
+# 1. General Concept
 
-When the original author A receives a message whose hash is in its `active_races` **and** the 60 s window has not expired:
+GhostRelay is a communication network based on **distributed retransmission**, where each node participates in transporting messages without knowing their real origin.
 
-1. Determine the return position:  
-   `place = len(ranking) + 1`  
-   (the same node can appear multiple times if it returns again later).
-2. Append the fingerprint of the signer to `ranking`.
-3. Calculate points:  
-   `points = total_bytes // place` (integer division, minimum 1).  
-   Examples for a 106‑byte message:  
-   - 1st return → 106 pts  
-   - 2nd return → 53 pts  
-   - 3rd return → 35 pts  
-   - 4th return → 26 pts, etc.
-4. Update `trusted_keys`: add the points to the signer’s record.
-5. If the signer was in `candidates`, **promote** it to `trusted_keys` and remove from `candidates`.
-6. The return message itself is **not retransmitted**.
+The concept of "ghost" comes precisely from the idea of **anonymity** within the network:
 
-After 60 s, the hash is removed from `active_races` and no further returns are credited.
+- A message does not reveal who originally created it;
+- Nodes do not know who the author of the message is;
+- Each node only knows who transmitted the message to it at that moment;
+- The network operates through **economic cooperation** between nodes.
+
+The goal of the incentive system is to make any node interested in retransmitting messages, because it receives a reward proportional to the help it provided to keep that message circulating.
 
 ---
 
-### 4. Messages from trusted nodes
+# 2. Node Identity and Wallets
 
-If the sender is in `trusted_keys`:
+Each node has a **digital wallet** composed of:
 
-- The message enters the **priority queue** with:
-  - `priority = current points of the sender` (from `trusted_keys`)
-  - `base = priority`
-  - `tx_count = 0`
-  - `born = monotonic timestamp`
+- Private key;
+- Public key.
 
-A separate thread (`retransmit_worker`) constantly processes the queue, always picking the item with the **highest priority**.
+The **private key** remains only on the device itself. It is used to:
 
-For each item:
-1. Sign `content + ID` with the node’s **own** private key (the original signature is replaced).
-2. Transmit `<content> <ID> <new_signature>` via ESP32.
-3. Wait for the ESP32 confirmation (`OK`).  
-   - **Failure**: the item is re‑enqueued with the same priority.  
-   - **Success**:  
-     - `tx_count += 1`  
-     - `new_priority = base // (tx_count + 1)`  
-     - If `new_priority >= 1` **and** `now - born < 60 s`, re‑enqueue with `new_priority`.  
-     - Otherwise, discard the item.
+- Sign messages;
+- Prove that the node is legitimate;
+- Participate in the network economy.
 
-Thus, high‑reputation messages are relayed more often and survive longer in the queue, but every message decays and eventually expires.
+The **public key** is shared with other nodes through the invite system.
 
 ---
 
-### 5. Messages from candidates
+# 3. Medium Access Rules (MAC)
 
-Candidates (nodes that sent an `invite` but never returned a message) receive a **fixed initial priority of 10**. The same decay and TTL rules apply. This gives them a small chance to prove themselves – if they return a message during its race window, they are promoted to `trusted_keys` and start accumulating real points.
+Before any transmission, the node follows a set of decentralized rules to avoid collisions and ensure fairness in channel usage.
 
----
+## 3.1 Mandatory Listening (Listen Before Talk)
 
-### 6. Invitations and the `candidates` list
+- The node **listens to the channel before transmitting**.
 
-- Any node can broadcast an invitation with the `invite` command.  
-  The invitation contains: `<public_key_base64> <signature_of_public_key>`.
-- Receiving nodes verify the self‑signature; if valid and the key is **not** in `trusted_keys`, they add the key to `candidates` (persisted in `candidates.json`).
+## 3.2 Random Wait Window
 
-**Candidate expiry (purge):**
+- When the channel becomes free, the node draws a random wait time between **0 and 50 ms**.
+- If, during the wait, the node hears a valid transmission, it **stops counting** and waits for that transmission to end.
+- When the channel becomes free again, the node **draws a new time** within a window reduced by half (0 to 25 ms in the example).
+- If the wait time reaches zero, the node **transmits immediately** — but its random window **doubles** for the next round (0 to 100 ms in the example).
 
-- Every time the node sends a **normal message** (not an invite), it takes a snapshot of its current `candidates`.
-- After **60 seconds**, all candidates that are still in the list and were not promoted are **removed**.
-- Candidates added *after* the snapshot are safe – they will face expiry only when the next message is sent.
+## 3.3 Tactical Rules
 
-This mechanism ensures that passive nodes that never relay anything are eventually forgotten, freeing resources.
+| Event | Effect on Wait Window |
+| :--- | :--- |
+| **Transmitted successfully** | Becomes **2 times more patient** (doubles the window) |
+| **Lost to another node** | Becomes **2 times less patient** (halves the window) |
+| **Collision** | Ignored — the node continues counting normally |
 
----
+**Rationale:** whoever manages to transmit yields space and becomes more patient. Whoever fails becomes more impatient, increasing their chances in the next round. Collisions are ignored because the node only reacts to transmissions it **can decode** — if it does not understand the message, it keeps counting until its turn comes.
 
-### 7. Priority queue and decay summary
+## 3.4 Complete MAC Cycle
 
-| Origin | Initial priority | Decay formula | Max lifetime in queue |
-|--------|------------------|---------------|----------------------|
-| Trusted node | Points in `trusted_keys` | `base // (tx_count+1)` | 60 s |
-| Candidate | 10 | `10 // (tx_count+1)` | 60 s |
-
-The queue is capped at 10 MB; if it becomes full, the lowest‑priority messages are dropped.
-
----
-
-### 🕵️ Anonymity of the original author
-
-Because each relaying node **replaces the signature** with its own, no intermediate node can trace the message back to the original creator. They only see the immediate predecessor. Only the original author (and the intended recipient, if encryption is used) know the true origin – hence the name **Ghost**Relay.
+1. The node listens to the channel.
+2. If the channel is busy, it waits for the transmission to end.
+3. When the channel becomes free, it draws a time within the current window.
+4. If another node transmits first, it halves the window.
+5. If it transmits itself, it doubles the window.
+6. Repeats the cycle indefinitely.
 
 ---
 
-## 📥 Installation & Usage
+# 4. Structure of a Common Message
 
-### Prerequisites
+Every message sent over the network has a digital signature. The basic transmitted structure is:
 
-- **Python 3.8+** (3.10+ recommended)
-- **pyserial**, **ecdsa**, **cryptography** – installed via `pip`
-- USB‑to‑TTL adapter / direct USB cable (or Bluetooth / WiFi as described below)
-- ESP32 with LoRa module running a compatible AT‑firmware
-
-### Get the code
-
-```bash
-git clone https://github.com/persev65-eng/GhostRelay-.git
-cd GhostRelay-
+```
+[MESSAGE][SIGNATURE]<0>
 ```
 
-Install dependencies
+Where:
 
-```bash
-pip install pyserial ecdsa cryptography
-```
+- **MESSAGE** is the content created by the user;
+- **SIGNATURE** is the digital signature generated by the transmitting node;
+- **`<0>`** is the end-of-transmission marker.
 
-On Termux (Android) you may need:
-
-```bash
-pkg install python-cryptography
-pip install ecdsa pyserial
-```
-
-Configure the connection (config.json)
-
-A default config.json is created on first run. Edit it to match your setup:
-
-```json
-{
-    "connection_type": "tcp",
-    "fallback_order": ["tcp", "usb", "bluetooth", "wifi_ap"],
-    "tcp_host": "127.0.0.1",
-    "tcp_port": 8080,
-    "usb_device": "/dev/ttyUSB0",
-    "baudrate": 115200,
-    "bt_device": "/dev/rfcomm0",
-    "wifi_ap_ssid": "",
-    "wifi_ap_ip": "192.168.4.1",
-    "wifi_ap_port": 8080
-}
-```
-
-Mode connection_type Required fields Notes
-TCP bridge "tcp" tcp_host, tcp_port Works everywhere without special permissions.
-USB serial "usb" usb_device, baudrate Direct cable. On Android use OTG + termux-usb.
-Bluetooth direct "bluetooth" bt_device (e.g., /dev/rfcomm0) Needs root on Android; on Linux pair and bind with rfcomm.
-WiFi AP "wifi_ap" wifi_ap_ip, wifi_ap_port Connect your PC/phone to the ESP32 hotspot first.
-
-The script tries the modes in fallback_order if the primary fails.
-
-Run the node
-
-```bash
-python3 relay.py
-```
-
-On first launch it generates your keys and shows your public key.
+The end marker lets the receiver know exactly when it has received the complete message.
 
 ---
 
-📋 Commands (while the node is running)
+# 5. Creating Your Own Message
 
-Command Description
-mykey Show your public key (share with others).
-addnode <name> <base64_key> Add a trusted relay node manually.
-addcontact <name> <base64_key> Add a contact for encrypted messaging.
-contacts List all contacts.
-credits View your own points earned from retransmissions.
-queue Show the retransmission queue (priorities, decay, TTL).
-trusted List trusted nodes and their points.
-candidates Show current candidate nodes.
-clear_candidates Remove all candidates manually.
-invite Broadcast your invitation (public key + signature).
-<message>:<contact> Send an encrypted message to that contact.
-<message> Send a plaintext message (asks confirmation).
-status, bw, sf, freq, … Direct ESP32 commands (if supported).
-clear Clear screen.
-Ctrl+C Stop the node.
+When a user creates a message, the flow is:
+
+```
+Create message
+   ↓
+Sign digitally
+   ↓
+Add marker <0>
+   ↓
+Calculate hash (only of the message, without signature and without <0>)
+   ↓
+Store hash in memory cache
+   ↓
+Add hash to the race list
+   ↓
+Place message in the retransmission queue
+```
+
+---
+
+# 6. Memory Cache and Loop Prevention
+
+Every message has a **hash**, which works as the network's memory. The node creates:
+
+```
+HASH = unique identification of the message
+```
+
+This hash is stored in a FIFO memory called **memory cache**. This memory prevents messages from circulating infinitely through the network.
+
+**Loop example:**
+
+```
+Node A → Node B → Node C → Node A (again)
+```
+
+When A receives the same message back:
+
+1. Calculates the hash;
+2. Checks the cache;
+3. If the hash already exists → **discards the message**;
+4. If it does not exist → registers it in the cache and continues processing.
 
 ---
 
-🧪 Quick test (two nodes)
+# 7. Race List
 
-1. Node A – run relay.py, type mykey, copy the Base64 DER line.
-2. Node B – run relay.py, type addnode NodeA <that_key>.
-3. Node A – type addnode NodeB <NodeB's_key> (optionally also addcontact Bob <key> for encryption).
-4. Node B – send Hello Alice:Alice (if Alice is a contact) → encrypted message.
-5. Node A receives and decrypts it automatically.
+In addition to the memory cache, own messages enter a second structure called the **race list**. This list has an economic function: it records messages that can generate rewards for nodes that help with retransmission.
 
-Both nodes will now relay each other’s messages and accumulate points.
+Each entry contains:
+
+```
+MESSAGE HASH + VALUE IN POINTS
+```
+
+**Example:**
+
+```
+Message X
+Hash: ABC123
+Value: 100 points
+```
 
 ---
+
+# 8. Calculating the Economic Value of a Message
+
+The value of a message does not depend on its size in bytes. What matters is the **time it occupies the radio**.
+
+The rule is:
+
+```
+1 millisecond of transmission = 1 point
+```
+
+The calculation considers the total time:
+
+```
+Total time = Message + Signature + Marker <0>
+```
+
+**Example:**
+
+| Part | Time |
+| :--- | :--- |
+| Message | 50 ms |
+| Signature | 40 ms |
+| `<0>` | 10 ms |
+| **Total** | **100 ms** |
+
+Economic value: **100 points**.
+
+The longer the message occupies the channel, the greater its value.
+
+---
+
+# 9. Initial Priority of Your Own Message
+
+Before entering the retransmission queue, the message receives a priority. The initial priority depends on neighboring nodes.
+
+Each node keeps an accumulated score of its neighbors.
+
+**Example:**
+
+| Neighbor | Points |
+| :--- | :--- |
+| Neighbor A | 500 |
+| Neighbor B | 200 |
+| Neighbor C | 100 |
+
+The highest value is **500**. So a newly created message receives:
+
+```
+Priority = highest neighbor score + 1 = 501 points
+```
+
+This message enters the queue with maximum priority.
+
+---
+
+# 10. Retransmission and Value Reduction
+
+When a message you created **returns to you** with another node's signature, the reward value **halves with each round**.
+
+The rule is:
+
+```
+Each round of your message signed by another node divides the reward by 2
+```
+
+**Example:**
+
+| Round | Reward |
+| :--- | :--- |
+| Message created | 100 points |
+| 1st round | 100 points (to the retransmitter) |
+| 2nd round | 50 points |
+| 3rd round | 25 points |
+| 4th round | 12.5 points |
+| ... | ... until it leaves the FIFO list |
+
+*and an addendum: the same public key can occupy several positions in this list*
+
+---
+
+# 11. Retransmission Queue
+
+All messages that need to be transmitted enter a **priority queue**. Each message has a priority.
+
+When a message is transmitted, its priority **halves**.
+
+**Example:**
+
+| Transmission | Priority |
+| :--- | :--- |
+| In queue | 100 points |
+| 1st transmission | 50 points |
+| 2nd transmission | 25 points |
+| 3rd transmission | 12.5 points |
+
+When the queue reaches its maximum capacity, the **oldest message is removed** (FIFO policy).
+
+---
+
+# 12. Wallet Invite
+
+There is a special type of message: the **invite**. Its purpose is to share a public wallet.
+
+The structure is:
+
+```
+[PUBLIC KEY][SIGNATURE]<0>
+```
+
+The invite works like a normal message regarding transmission:
+
+- It has a signature;
+- It has an end marker;
+- It enters the queue;
+- It has priority.
+
+**Difference:** invites **do not enter the race list**. That is, they **do not generate rewards** for retransmitters.
+
+---
+
+# 13. Receiving a Message
+
+When a node receives a transmission, it **does not process it immediately**. It keeps listening until it finds the marker:
+
+```
+<0>
+```
+
+Only at that moment does it consider the message complete. Then:
+
+1. Removes the `<0>`, leaving `[MESSAGE][SIGNATURE]`;
+2. Separates the signature by counting backwards (the node knows the fixed signature length);
+3. Isolates the content: `[MESSAGE]` + `[SIGNATURE]`.
+
+---
+
+# 14. Cache Verification
+
+The node calculates the hash **only of the message**, without the signature and without the `<0>`:
+
+```
+HASH = hash(message)
+```
+
+Checks the cache:
+
+- If the hash **already exists** → discards the message;
+- If it **does not exist** → registers it in the cache and continues processing.
+
+---
+
+# 15. Wallet Verification
+
+Then the node verifies the signature and looks for which **public wallet** it belongs to. It checks:
+
+- Known neighbors (trusted_keys);
+- Neighbors present in the invite list (candidates).
+
+If the signature **does not belong to any wallet** → discards the message.
+
+If it **belongs** → continues processing.
+
+---
+
+# 16. Signature Replacement During Retransmission
+
+GhostRelay **does not accumulate signatures**. The old signature is removed.
+
+**Example received:**
+
+```
+[MESSAGE][SIGNATURE_A]<0>
+```
+
+The node removes `SIGNATURE_A`, leaving `[MESSAGE]`. Then it signs again:
+
+```
+[MESSAGE][SIGNATURE_B]<0>
+```
+
+Thus, each retransmission carries **only the current node's signature**. The original origin remains unknown.
+
+---
+
+# 17. Priority of Messages Received from Known Neighbors
+
+When a valid message arrives from a **known neighbor**, the node calculates priority using the formula:
+
+```
+Priority = accumulated points of the neighbor / message time in ms
+```
+
+**Example:**
+
+| Data | Value |
+| :--- | :--- |
+| Neighbor points | 1000 |
+| Message time | 10 ms |
+| **Priority** | 1000 / 10 = **100 points** |
+
+This will be the message's priority in the queue.
+
+---
+
+# 18. Unknown Neighbors
+
+There is an intermediate category: **unknown neighbors**.
+
+When a valid invite arrives, the node checks:
+
+1. Does the signature correspond to the public key?
+2. Does this key already exist in any list?
+
+If it **already exists** → discards the invite.
+
+If it **does not exist** → adds it to the **unknown neighbors** list (candidates).
+
+---
+
+# 19. Promotion of an Unknown Neighbor
+
+An unknown neighbor **does not gain trust just by sending an invite**. It must demonstrate contribution.
+
+When it retransmits a message that belongs to its **race list**, it is promoted:
+
+```
+UNKNOWN NEIGHBOR → KNOWN NEIGHBOR
+```
+
+Then it receives the points referring to the retransmitted message.
+
+---
+
+# 20. Messages Coming from Unknown Neighbors
+
+When a message arrives from an unknown neighbor, the process is:
+
+1. Calculate hash;
+2. Store in cache;
+3. Verify signature;
+4. Remove old signature;
+5. Add own signature;
+6. Insert into race list.
+
+However, the **initial priority** is different:
+
+```
+Priority = 10 / message time in ms
+```
+
+---
+
+# 21. Fundamental Rule: Fidelity to Radio Parameters
+
+Every received message that goes to the retransmission queue must, **before entering the queue**, have its radio parameters analyzed:
+
+- **SF** (Spreading Factor);
+- **BW** (Bandwidth);
+- **CR** (Coding Rate).
+
+The LR2021 supports **multiple SFs**, so it is essential to correctly identify which configuration was used in the original transmission.
+
+**When transmitting**, the node **must mandatorily** use the same SF, BW, and CR with which the message was heard.
+
+**When creating a message**, the author **will only award points** if the message that returns has **exactly the same SF, BW, and CR** as the original transmission. Otherwise, the reward **is not granted**.
+
+This rule ensures the integrity of the reputation system and prevents nodes from trying to cheat the economy by transmitting with different configurations.
+
+---
+
+# 22. Communication with External Programs (WebSocket Server)
+
+So that external applications (PC programs, apps, web services) can use the decentralized GhostRelay network, an **communication interface** must be exposed that allows:
+
+```
+[External application] 
+        ↓
+   WebSocket / HTTP
+        ↓
+   [ESP32 + GhostRelay]
+        ↓
+   [E80-900M2212S(LR2021)]
+        ↓
+    LoRa Network
+```
+
+The ESP32 acts as a **bridge** between the IP world (WebSocket) and the LoRa world (Sub-GHz radio). This way, any program capable of connecting to a WebSocket can send and receive messages through the GhostRelay network, without needing to know the details of the LoRa protocol.
+
+---
+
+# 23. Final Remarks
+
+- The system creates a **reputation economy**: nodes that retransmit correctly earn points and have their own messages propagated with higher priority.
+- Unknown nodes enter as **candidates** and must prove their usefulness by retransmitting messages in races to be promoted.
+- The **hash cache** prevents loops and repeated processing.
+- The **race**, **candidates**, and **priority queue** lists are managed as FIFO caches, without depending on a fixed expiration time.
+- **Fidelity to transmission parameters** (SF, BW, CR) is essential for the reward mechanism to work.
+- The reward is proportional to the **airtime** of the original message (1 ms = 1 point).
+- **Anonymity** is preserved because each retransmitter replaces the previous signature with its own, hiding the original origin.
+
+---
+
+
 
 💰 Support the project
 
-I truly believe this project can change the world.
-If you find this work useful and would like to support its development with a donation, I would be very grateful.
+I truly believe this project can change the world. If you find this work useful and would like to support its development with a donation, I would be very grateful.
 
-Monero address:
-49YdksRCWR3TY2A3WopX9322EGzzxBrFv4NbTho4DCNhSzUGfnAivcJNuAqEYCFjw8EYwbk4x745XjTt1Kh5n9KbNorXSD6
-
----
+Monero address: 49YdksRCWR3TY2A3WopX9322EGzzxBrFv4NbTho4DCNhSzUGfnAivcJNuAqEYCFjw8EYwbk4x745XjTt1Kh5n9KbNorXSD6
 
 📝 License / Contributing
 
