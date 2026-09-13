@@ -1,3 +1,14 @@
+> ⚠️ **WARNING: PROJECT UNDER CONSTRUCTION** ⚠️
+>
+> This project is still under development and **has not been tested**.
+> 
+> It is very likely to contain **bugs**, **incomplete parts**, and **missing scripts**.
+> 
+> **It is not ready for production use.** Use at your own risk.
+> 
+> Contributions, corrections, and suggestions are very welcome!
+
+
 # GhostRelay — Message Protocol, Phantom Retransmission, and Economic Incentive
 
 ---
