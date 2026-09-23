@@ -1,104 +1,72 @@
 #!/usr/bin/env python3
 
 """
-GhostRelay - Race List
-
-Lista econômica das mensagens em circulação.
+GhostRelay - Lista Corrida
 
 Responsabilidade:
 
-- Registrar mensagens criadas pelo nó
-- Guardar valor econômico
-- Detectar retorno da mensagem
-- Recompensar retransmissores
-- Reduzir valor por salto
-
+- Registrar as MINHAS mensagens em circulação (seção 7)
+- Guardar o valor de cada uma, decidido UMA vez (seção 8)
+- Controlar as duas corridas de recompensa de cada mensagem
+- Reter a corrida da ida até a entrega ser confirmada
 
 Não controla:
-- assinatura
-- rádio
-- fila
-- vizinhos
+- rádio, fila, cifragem, vizinhos (só devolve a quem pagar e quanto)
 
 
-COMO A RECOMPENSA FUNCIONA (seção 10)
--------------------------------------
-Um nó pode retransmitir a mesma mensagem quantas vezes quiser: é isso
-que dá à mensagem mais chances de atravessar a rede.
+SÓ MENSAGEM PRÓPRIA ENTRA AQUI
+------------------------------
+Relay nunca paga relay. Só o autor paga.
 
-Cada retorno ocupa uma POSIÇÃO na lista de recompensa daquela mensagem,
-e cada posição vale metade da anterior -- não importa quem retornou:
-
-    mensagem vale 100
-
-    1o retorno -> B     100 pontos
-    2o retorno -> C      50 pontos
-    3o retorno -> B      25 pontos
-    4o retorno -> ...  12,5 pontos
-
-A mesma carteira pode ocupar várias posições (adendo da seção 10).
-O freio é econômico, não uma regra: repetir custa o mesmo tempo de
-antena e rende metade.
-
-A entrada continua pagando até sair da lista, e ela só sai por FIFO,
-quando a lista lota (seção 23). Não existe valor mínimo nem prazo.
+Se um relay pagasse, o autor ganharia pontos infinitos: B retransmite a
+mensagem de A e a registra na própria corrida; A repete a mensagem;
+B vê a mensagem na corrida dele e paga A - pela mensagem do próprio A.
+Cada mensagem nova que A cria vira uma fonte de pagamento que ele
+ordenha repetindo, sem nunca carregar nada de ninguém.
 
 
-O QUE ENTRA AQUI
+AS DUAS CORRIDAS
 ----------------
-- Mensagem própria, no momento em que é criada (seções 5 e 7).
-- Mensagem que eu retransmiti (seção 20, item 6). É isso que me permite
-  recompensar - e promover, pela seção 19 - quem continuar carregando
-  tráfego que não nasceu comigo.
+Cada mensagem abre duas corridas do MESMO valor (1 ms de antena = 1
+ponto), e as duas funcionam igual - posição 1 leva 100%, posição 2
+leva 50%, e assim por diante (seção 10):
 
-Convite NUNCA entra: ele não gera recompensa (seção 12).
+    IDA    quem retransmitiu a minha mensagem (eu ouvi voltar)
+    VOLTA  quem me entregou a confirmação do destinatário
+
+A corrida da IDA fica RETIDA: as posições são ocupadas normalmente -
+cada retorno consome uma posição e divide o valor da próxima -, mas
+ninguém recebe até a primeira confirmação chegar. Se ela nunca chegar,
+ninguém recebe nunca. Depois que chega, paga o acumulado e passa a
+pagar na hora.
+
+A corrida da VOLTA paga na hora: quem traz a confirmação já provou a
+entrega.
+
+Quando a primeira confirmação chega, o destinatário também recebe, em
+pontos de CONTATO, o valor da mensagem - uma vez só por mensagem, por
+mais cópias da confirmação que cheguem.
 
 
-O QUE FOI CORRIGIDO NESTA VERSÃO
---------------------------------
-1) A SEÇÃO 21 NÃO TINHA COMO SER APLICADA.
+DOIS HASHES POR MENSAGEM
+------------------------
+    hash           do bloco cifrado. Igual em todos os saltos (só a
+                   assinatura de fora muda), e é o que os relays veem.
+                   Reconhece a mensagem voltando.
 
-   A entrada guardava hash e pontos, mas não com que SF/BW/CR a
-   mensagem saiu. Sem isso não há como cumprir "o autor só dará pontos
-   se a mensagem que voltou tiver exatamente o mesmo SF, BW e CR".
-   reward_relay() pagava qualquer retorno, inclusive de quem
-   retransmitisse num SF mais barato para gastar menos antena e
-   receber o mesmo.
+    hash_conteudo  do texto em claro. Só autor e destinatário
+                   conhecem. É o que a confirmação carrega.
 
-2) PAGAVA SEM SABER PARA QUEM.
+E, depois da confirmação, um terceiro índice:
 
-   helper_key era opcional: reward_relay("hash") consumia uma posição
-   da lista e devolvia os pontos sem registrar ajudante nenhum.
-
-3) find() ERA UMA VARREDURA LINEAR.
-
-   Percorria até 1000 entradas, a cada pacote recebido, duas vezes
-   (find e depois reward_relay chamando find de novo). Agora é busca
-   direta por hash, e a ordem FIFO continua preservada.
-
-4) add_message() ACEITAVA O MESMO HASH DUAS VEZES.
-
-   Criava duas entradas para a mesma mensagem; find() só achava a
-   primeira e a segunda ficava ocupando posição à toa.
-
-5) helpers E rewards CRESCIAM SEM LIMITE.
-
-   Como não há teto de retornos, o histórico de uma entrada crescia
-   indefinidamente.
-
-6) SEM PERSISTÊNCIA E SEM LOCK.
-
-   Reiniciar o nó apagava as mensagens em circulação: quem ainda
-   estivesse carregando uma mensagem sua não receberia nada ao
-   devolvê-la. E a lista é tocada pela thread do rádio e pelo laço
-   principal ao mesmo tempo.
+    hash_confirmacao  do bloco da confirmação, para reconhecer as
+                      próximas cópias dela sem precisar decifrar de novo.
 """
-
 
 import threading
 import time
-from collections import OrderedDict
 
+from collections import OrderedDict
 
 try:
 
@@ -109,149 +77,138 @@ except Exception:
     GhostEconomy = None
 
 
-# Quantas posições de histórico guardar por entrada
+# quantos pagamentos ficam no histórico de cada corrida
 MAX_HISTORICO = 64
+
+
+def _corrida(valor):
+
+    return {
+
+        "atual": float(valor),     # quanto vale a PRÓXIMA posição
+
+        "posicoes": 0,             # posições já ocupadas
+
+        "pendentes": [],           # [chave, pontos] retidos (só na ida)
+
+        "pagos": []                # [chave, pontos, instante]
+
+    }
 
 
 class RaceList:
 
 
-    def __init__(
-        self,
-        max_size=1000,
-        storage=None
-    ):
-
-        self.max_size = max(1, int(max_size))
+    def __init__(self, storage=None, max_size=1000):
 
         self.storage = storage
 
-        # OrderedDict: busca direta por hash E ordem de chegada,
-        # que é o que a política FIFO da seção 23 precisa
+        self.max_size = max(1, int(max_size))
+
+        # hash do bloco da mensagem -> entrada (ordem = FIFO, seção 23)
         self.entries = OrderedDict()
+
+        # hash do bloco da confirmação -> hash da mensagem
+        self.confirmacoes = {}
 
         self.lock = threading.RLock()
 
-        self.total_pago = 0.0
-
-        self.descartadas = 0
-
-        if self.storage:
-
-            self.load()
-
+        self.load()
 
 
     # =================================================
-    # ADICIONAR MENSAGEM NA CORRIDA
+    # REGISTRO (seções 5, 7 e 8)
     # =================================================
 
-
-    def add_message(
-        self,
-        msg_hash,
-        points,
-        radio=None,
-        own=True
-    ):
-
+    def add_message(self, msg_hash, valor, radio, hash_conteudo, destinatario):
         """
-        Seções 7 e 8 - a entrada é o hash mais o valor em pontos, e o
-        valor é o tempo de antena da mensagem.
-
-        radio guarda com que SF/BW/CR ela saiu. É essa cópia que a
-        seção 21 compara quando a mensagem volta.
-
-        Chamar duas vezes com o mesmo hash não cria outra entrada:
-        a mensagem é uma só, por mais vezes que seja transmitida.
+        Só mensagem PRÓPRIA. O valor é decidido aqui e nunca mais é
+        recalculado: depois disso só cai pela metade a cada posição.
         """
 
-        if not msg_hash:
+        if not msg_hash or not hash_conteudo or not destinatario:
 
             return None
 
+        radio = self._normalizar(radio)
+
         with self.lock:
 
-            if msg_hash in self.entries:
+            existente = self.entries.get(msg_hash)
 
-                return self.entries[msg_hash]
+            if existente:
+
+                return existente
 
             entry = {
 
-
                 "hash": msg_hash,
 
+                "hash_conteudo": hash_conteudo,
 
-                "initial_points": float(points),
+                "destinatario": destinatario,
 
+                "own": True,
 
-                "current_points": float(points),
+                "valor": float(valor),
 
-
-                "radio": dict(radio) if radio else None,
-
-
-                "own": bool(own),
-
+                "radio": radio,
 
                 "created": time.time(),
 
+                "confirmada": False,
 
-                "hits": 0,
+                "confirmada_em": None,
 
+                "hash_confirmacao": None,
 
-                "total_paid": 0.0,
+                "contato_pago": False,
 
+                "ida": _corrida(valor),
 
-                # Histórico de nós que ajudaram.
-                # Cada posição representa uma retransmissão
-                # válida detectada pela corrida.
-
-                "helpers": [],
-
-
-                # Guarda pagamentos já calculados.
-
-                "rewards": []
-
+                "volta": _corrida(valor)
 
             }
-
 
             self.entries[msg_hash] = entry
 
             self._aparar()
 
-            return entry
+        self.save()
+
+        return entry
 
 
     def _aparar(self):
-        """
-        Seção 23 - quando a lista lota, sai a mais antiga.
-        Chamado sempre com o lock adquirido.
-        """
 
         while len(self.entries) > self.max_size:
 
-            self.entries.popitem(last=False)
+            _, saiu = self.entries.popitem(last=False)
 
-            self.descartadas += 1
+            if saiu.get("hash_confirmacao"):
 
+                self.confirmacoes.pop(saiu["hash_confirmacao"], None)
+
+
+    @staticmethod
+    def _normalizar(radio):
+
+        if not radio:
+
+            return None
+
+        if GhostEconomy:
+
+            return GhostEconomy.normalize_radio(radio)
+
+        return dict(radio)
 
 
     # =================================================
-    # PROCURAR MENSAGEM
+    # CONSULTA
     # =================================================
 
-
-    def find(
-        self,
-        msg_hash
-    ):
-
-        """
-        Procura mensagem na corrida.
-        """
+    def find(self, msg_hash):
 
         with self.lock:
 
@@ -265,25 +222,56 @@ class RaceList:
             return msg_hash in self.entries
 
 
-
-    # =================================================
-    # SEÇÃO 21 - FIDELIDADE DE RÁDIO
-    # =================================================
-
-
-    def radio_confere(self, msg_hash, radio):
+    def find_confirmacao(self, hash_bloco_confirmacao):
         """
-        O retorno veio com o mesmo SF/BW/CR da transmissão original?
-
-        Entrada sem rádio registrado passa: é mensagem antiga, gravada
-        antes desta informação existir, e recusar seria pior.
+        Uma cópia de confirmação que eu já reconheci antes.
         """
 
-        entry = self.find(msg_hash)
+        with self.lock:
 
-        if entry is None:
+            msg_hash = self.confirmacoes.get(hash_bloco_confirmacao)
 
-            return False
+            return self.entries.get(msg_hash) if msg_hash else None
+
+
+    def find_por_conteudo(self, hash_conteudo, destinatario):
+        """
+        A mensagem que uma confirmação nova está confirmando.
+
+        Se houver mais de uma com o mesmo texto para o mesmo destinatário,
+        cada confirmação liquida a mais antiga ainda não confirmada.
+        """
+
+        with self.lock:
+
+            candidatas = [
+
+                e for e in self.entries.values()
+
+                if e["hash_conteudo"] == hash_conteudo
+
+                and e["destinatario"] == destinatario
+
+            ]
+
+        if not candidatas:
+
+            return None
+
+        for e in candidatas:
+
+            if not e["confirmada"]:
+
+                return e
+
+        return candidatas[0]
+
+
+    def radio_confere(self, entry, radio):
+        """
+        Seção 21: só paga retorno que veio com EXATAMENTE os SF/BW/CR
+        com que a mensagem saiu.
+        """
 
         original = entry.get("radio")
 
@@ -299,46 +287,26 @@ class RaceList:
 
             return GhostEconomy.reward_allowed(original, radio)
 
-        return (
-
-            original.get("sf") == radio.get("sf")
-
-            and original.get("bw") == radio.get("bw")
-
-            and original.get("cr") == radio.get("cr")
-
-        )
-
+        return (original.get("sf") == radio.get("sf")
+                and original.get("bw") == radio.get("bw")
+                and original.get("cr") == radio.get("cr"))
 
 
     # =================================================
-    # MENSAGEM FOI RETRANSMITIDA
+    # CORRIDA DA IDA (retida até a confirmação)
     # =================================================
 
-
-    def process_return(
-        self,
-        msg_hash,
-        helper_key,
-        radio=None
-    ):
-
+    def retorno_ida(self, msg_hash, chave, radio):
         """
-        Um nó devolveu uma mensagem que está nesta lista.
+        Ouvi alguém retransmitindo a minha mensagem.
+
+        A posição é ocupada e o valor da próxima cai pela metade na
+        hora - mesmo retida. Se não caísse, um retorno antes da
+        confirmação e outro depois valeriam o mesmo.
 
         Devolve:
-
-            {
-              "ok": pagou ou não,
-              "pontos": quanto foi pago,
-              "motivo": por que não pagou,
-              "posicao": qual posição da lista ele ocupou,
-              "proximo": quanto vale a próxima posição
-            }
-
-        Retorno recusado NÃO consome posição: quem transmitiu com outro
-        SF não ocupa lugar na fila de recompensa nem empurra o valor
-        para baixo para os próximos.
+            {"ok", "motivo", "posicao", "pontos", "retido"}
+        retido=True: guarde, ainda não pague.
         """
 
         with self.lock:
@@ -347,254 +315,164 @@ class RaceList:
 
             if entry is None:
 
-                return {
+                return {"ok": False, "motivo": "fora da lista corrida"}
 
-                    "ok": False,
+            if not self.radio_confere(entry, radio):
 
-                    "pontos": 0.0,
+                # não consome posição: senão bastaria transmitir numa
+                # configuração barata para queimar as posições caras
+                return {"ok": False, "motivo": "SF/BW/CR diferentes (secao 21)"}
 
-                    "motivo": "fora da lista corrida",
+            corrida = entry["ida"]
 
-                    "posicao": 0,
+            pontos = corrida["atual"]
 
-                    "proximo": 0.0
+            corrida["posicoes"] += 1
 
-                }
+            corrida["atual"] = pontos / 2.0
 
-            if not helper_key:
+            posicao = corrida["posicoes"]
 
-                return {
+            if entry["confirmada"]:
 
-                    "ok": False,
+                self._registrar_pago(corrida, chave, pontos)
 
-                    "pontos": 0.0,
+                retido = False
 
-                    "motivo": "sem carteira do retransmissor",
+            else:
 
-                    "posicao": entry["hits"],
+                corrida["pendentes"].append([chave, pontos])
 
-                    "proximo": entry["current_points"]
+                retido = True
 
-                }
+        self.save()
 
-            # Seção 21 - sem os mesmos parâmetros, sem recompensa
-            if not self.radio_confere(msg_hash, radio):
-
-                return {
-
-                    "ok": False,
-
-                    "pontos": 0.0,
-
-                    "motivo": "SF/BW/CR diferentes do original",
-
-                    "posicao": entry["hits"],
-
-                    "proximo": entry["current_points"]
-
-                }
-
-            reward = entry["current_points"]
-
-            entry["hits"] += 1
-
-            entry["total_paid"] += reward
-
-            self.total_pago += reward
-
-            entry["helpers"].append(helper_key)
-
-            entry["rewards"].append({
-
-                "node": helper_key,
-
-                "points": reward,
-
-                "time": time.time()
-
-            })
-
-            # o histórico é diagnóstico, não protocolo: não pode crescer
-            # sem fim só porque a mensagem continua circulando
-            if len(entry["helpers"]) > MAX_HISTORICO:
-
-                del entry["helpers"][:-MAX_HISTORICO]
-
-                del entry["rewards"][:-MAX_HISTORICO]
-
-            # Seção 10 - a próxima posição vale metade
-            entry["current_points"] /= 2
-
-            return {
-
-                "ok": True,
-
-                "pontos": reward,
-
-                "motivo": "ok",
-
-                "posicao": entry["hits"],
-
-                "proximo": entry["current_points"]
-
-            }
-
-
-    def reward_relay(
-        self,
-        msg_hash,
-        helper_key=None,
-        radio=None
-    ):
-
-        """
-        Mesma coisa, devolvendo só os pontos.
-
-        A recompensa diminui pela metade
-        a cada retransmissão válida.
-
-        Primeira ajuda:
-        100
-
-        Segunda:
-        50
-
-        Terceira:
-        25
-        """
-
-        return self.process_return(
-
-            msg_hash,
-
-            helper_key,
-
-            radio
-
-        )["pontos"]
-
-
+        return {"ok": True, "motivo": "ok", "posicao": posicao,
+                "pontos": pontos, "retido": retido}
 
 
     # =================================================
-    # HISTÓRICO DE AJUDANTES
+    # CONFIRMAÇÃO E CORRIDA DA VOLTA
     # =================================================
 
-
-    def get_helpers(
-        self,
-        msg_hash
-    ):
-
+    def confirmar(self, msg_hash, hash_bloco_confirmacao):
         """
-        Retorna todos os nós que
-        retransmitiram uma mensagem.
+        A PRIMEIRA confirmação desta mensagem chegou.
+
+        Libera a corrida da ida e o crédito do destinatário, uma vez só.
+
+        Devolve:
+            {"primeira": bool,
+             "liberar": [[chave, pontos], ...],   corrida da ida retida
+             "contato": (destinatario, valor) ou None}
         """
-
-
-        entry = self.find(
-            msg_hash
-        )
-
-
-        if entry:
-
-            return list(entry["helpers"])
-
-
-        return []
-
-
-
-    def get_rewards(
-        self,
-        msg_hash
-    ):
-
-        """
-        Retorna o histórico de recompensas.
-        """
-
-
-        entry = self.find(
-            msg_hash
-        )
-
-
-        if entry:
-
-            return list(entry["rewards"])
-
-
-        return []
-
-
-
-    # =================================================
-    # VALOR ATUAL
-    # =================================================
-
-
-    def get_value(
-        self,
-        msg_hash
-    ):
-        """
-        Quanto vale a PRÓXIMA posição desta mensagem.
-        """
-
-        entry = self.find(
-            msg_hash
-        )
-
-
-        if entry:
-
-            return entry[
-                "current_points"
-            ]
-
-
-        return 0
-
-
-    def get_radio(self, msg_hash):
-        """
-        Com que SF/BW/CR a mensagem saiu (seção 21).
-        """
-
-        entry = self.find(msg_hash)
-
-        return dict(entry["radio"]) if entry and entry["radio"] else None
-
-
-
-    # =================================================
-    # REMOVER
-    # =================================================
-
-
-    def remove(
-        self,
-        msg_hash
-    ):
 
         with self.lock:
 
-            if msg_hash in self.entries:
+            entry = self.entries.get(msg_hash)
 
-                del self.entries[msg_hash]
+            if entry is None:
 
-                return True
+                return {"primeira": False, "liberar": [], "contato": None}
 
-            return False
+            if entry["confirmada"]:
+
+                return {"primeira": False, "liberar": [], "contato": None}
+
+            entry["confirmada"] = True
+
+            entry["confirmada_em"] = time.time()
+
+            entry["hash_confirmacao"] = hash_bloco_confirmacao
+
+            self.confirmacoes[hash_bloco_confirmacao] = msg_hash
+
+            liberar = entry["ida"]["pendentes"]
+
+            entry["ida"]["pendentes"] = []
+
+            for chave, pontos in liberar:
+
+                self._registrar_pago(entry["ida"], chave, pontos)
+
+            contato = None
+
+            if not entry["contato_pago"]:
+
+                entry["contato_pago"] = True
+
+                contato = (entry["destinatario"], entry["valor"])
+
+        self.save()
+
+        return {"primeira": True, "liberar": liberar, "contato": contato}
 
 
+    def retorno_volta(self, msg_hash, chave, radio):
+        """
+        Alguém me entregou a confirmação. Paga na hora, nas posições.
+        A confirmação viaja com os mesmos SF/BW/CR da mensagem.
+        """
+
+        with self.lock:
+
+            entry = self.entries.get(msg_hash)
+
+            if entry is None:
+
+                return {"ok": False, "motivo": "fora da lista corrida"}
+
+            if not self.radio_confere(entry, radio):
+
+                return {"ok": False, "motivo": "SF/BW/CR diferentes (secao 21)"}
+
+            corrida = entry["volta"]
+
+            pontos = corrida["atual"]
+
+            corrida["posicoes"] += 1
+
+            corrida["atual"] = pontos / 2.0
+
+            posicao = corrida["posicoes"]
+
+            self._registrar_pago(corrida, chave, pontos)
+
+        self.save()
+
+        return {"ok": True, "motivo": "ok", "posicao": posicao,
+                "pontos": pontos, "retido": False}
+
+
+    @staticmethod
+    def _registrar_pago(corrida, chave, pontos):
+
+        corrida["pagos"].append([chave, pontos, time.time()])
+
+        if len(corrida["pagos"]) > MAX_HISTORICO:
+
+            del corrida["pagos"][:-MAX_HISTORICO]
 
 
     # =================================================
-    # LIMPAR
+    # MANUTENÇÃO E INFORMAÇÃO
     # =================================================
+
+    def remove(self, msg_hash):
+
+        with self.lock:
+
+            saiu = self.entries.pop(msg_hash, None)
+
+            if saiu and saiu.get("hash_confirmacao"):
+
+                self.confirmacoes.pop(saiu["hash_confirmacao"], None)
+
+        if saiu:
+
+            self.save()
+
+        return saiu is not None
 
 
     def clear(self):
@@ -603,11 +481,9 @@ class RaceList:
 
             self.entries.clear()
 
+            self.confirmacoes.clear()
 
-
-    # =================================================
-    # LISTAGEM
-    # =================================================
+        self.save()
 
 
     def get_all(self):
@@ -615,7 +491,6 @@ class RaceList:
         with self.lock:
 
             return list(self.entries.values())
-
 
 
     def size(self):
@@ -629,39 +504,32 @@ class RaceList:
 
         with self.lock:
 
-            proprias = sum(1 for e in self.entries.values() if e["own"])
+            total = len(self.entries)
 
-            return {
+            confirmadas = sum(1 for e in self.entries.values() if e["confirmada"])
 
-                "entradas": len(self.entries),
+            retidos = sum(
 
-                "proprias": proprias,
+                sum(p for _, p in e["ida"]["pendentes"])
 
-                "retransmitidas": len(self.entries) - proprias,
+                for e in self.entries.values()
 
-                "pontos_pagos": round(self.total_pago, 2),
+            )
 
-                "descartadas_fifo": self.descartadas
-
-            }
-
+        return {"mensagens": total, "confirmadas": confirmadas,
+                "aguardando": total - confirmadas,
+                "pontos_retidos": round(retidos, 1)}
 
 
     # =================================================
     # PERSISTÊNCIA
     # =================================================
 
-
     def load(self):
-        """
-        Mensagem sua continua circulando depois que o nó reinicia.
-        Sem recuperar a lista, quem devolvesse uma delas não receberia
-        nada, e teria gastado antena de graça.
-        """
 
         if not self.storage:
 
-            return False
+            return
 
         try:
 
@@ -669,128 +537,55 @@ class RaceList:
 
         except Exception:
 
-            return False
+            return
 
         if not isinstance(dados, list):
 
-            return False
+            return
+
+        descartadas = 0
 
         with self.lock:
 
-            for entry in dados:
+            for e in dados:
 
-                if not isinstance(entry, dict):
+                # formato antigo (mensagem em claro, sem destinatário) ou
+                # entrada de mensagem RETRANSMITIDA: nenhuma das duas
+                # existe mais neste protocolo
+                if (not isinstance(e, dict) or "ida" not in e
+                        or not e.get("own") or not e.get("destinatario")):
+
+                    descartadas += 1
 
                     continue
 
-                msg_hash = entry.get("hash")
+                self.entries[e["hash"]] = e
 
-                if not msg_hash:
+                if e.get("hash_confirmacao"):
 
-                    continue
-
-                self.entries[msg_hash] = {
-
-                    "hash": msg_hash,
-
-                    "initial_points": float(entry.get("initial_points", 0) or 0),
-
-                    "current_points": float(entry.get("current_points", 0) or 0),
-
-                    "radio": entry.get("radio"),
-
-                    "own": bool(entry.get("own", True)),
-
-                    "created": float(entry.get("created", time.time())),
-
-                    "hits": int(entry.get("hits", 0) or 0),
-
-                    "total_paid": float(entry.get("total_paid", 0) or 0),
-
-                    "helpers": list(entry.get("helpers") or [])[-MAX_HISTORICO:],
-
-                    "rewards": list(entry.get("rewards") or [])[-MAX_HISTORICO:]
-
-                }
+                    self.confirmacoes[e["hash_confirmacao"]] = e["hash"]
 
             self._aparar()
 
-        return True
+        if descartadas:
+
+            print("[RACE] %d entradas do formato antigo descartadas" % descartadas)
 
 
     def save(self):
 
         if not self.storage:
 
-            return False
+            return
 
         with self.lock:
 
-            dados = list(self.entries.values())
+            dados = [dict(e) for e in self.entries.values()]
 
         try:
 
             self.storage.save_race(dados)
 
-            return True
+        except Exception as erro:
 
-        except Exception:
-
-            return False
-
-
-
-# =====================================================
-# TESTE
-# =====================================================
-
-
-if __name__ == "__main__":
-
-    RADIO = {"sf": 12, "bw": 250.0, "cr": 7}
-
-    race = RaceList(max_size=5)
-
-    race.add_message("ABC123", 100, radio=RADIO)
-
-    print("=" * 58)
-    print(" SEÇÃO 10 - POSIÇÕES DA LISTA DE RECOMPENSA")
-    print("=" * 58)
-    print("  mensagem ABC123 vale %.0f pontos\n"
-          % race.get_value("ABC123"))
-
-    for retorno, quem in enumerate(("B", "C", "B", "D"), start=1):
-
-        r = race.process_return("ABC123", quem, RADIO)
-
-        print("  %do retorno -> %s   %8.2f pontos   (proxima posicao: %.2f)"
-              % (retorno, quem, r["pontos"], r["proximo"]))
-
-    print("\n  a mesma carteira ocupou duas posicoes:",
-          race.get_helpers("ABC123"))
-
-    print("\n" + "=" * 58)
-    print(" SEÇÃO 21 - RETORNO COM OUTRO SF")
-    print("=" * 58)
-
-    antes = race.get_value("ABC123")
-
-    r = race.process_return("ABC123", "E", {"sf": 7, "bw": 250.0, "cr": 7})
-
-    print("  pagou?", r["ok"], "|", r["motivo"])
-    print("  a posicao continua valendo %.2f (nao foi consumida)"
-          % race.get_value("ABC123"))
-    print("  valor intacto?", race.get_value("ABC123") == antes)
-
-    print("\n" + "=" * 58)
-    print(" SEÇÃO 23 - FIFO")
-    print("=" * 58)
-
-    for i in range(6):
-
-        race.add_message("msg_%d" % i, 50, radio=RADIO)
-
-    print("  limite 5, foram inseridas 7 mensagens no total")
-    print("  entradas agora:", race.size())
-    print("  ABC123 ainda existe?", race.exists("ABC123"))
-    print("  resumo:", race.resumo())
+            print("[RACE] nao consegui gravar:", erro)

@@ -1,6 +1,25 @@
 #!/usr/bin/env python3
 
 """
+FORMATO NOVO (confirmação de entrega)
+-------------------------------------
+Mensagem e confirmação usam o mesmo formato de fora de sempre:
+
+    [BLOCO CIFRADO EM BASE64][ASSINATURA DO SALTO]<0>
+
+O bloco é uma caixa autenticada (crypto_box do NaCl) entre o autor e o
+destinatário: só o destinatário abre, e abrir já prova quem criou - a
+assinatura do autor vai fundida na cifragem. Dentro dele:
+
+    "M" + texto          mensagem         (até 82 bytes de texto)
+    "C" + hash do texto  confirmação      (32 bytes)
+
+Os relays não leem nada: veem só o bloco, o reassinam no salto e o
+passam adiante. O hash do bloco é igual em todos os saltos, e é o que
+o cache e o reconhecimento de retorno usam.
+
+Convite não muda: [CHAVE PÚBLICA][ASSINATURA]<0>, em claro.
+
 GhostRelay - Message Protocol
 
 Responsabilidades:
@@ -79,6 +98,10 @@ O QUE FOI CORRIGIDO NESTA VERSÃO
 """
 
 
+import base64
+import hashlib
+
+
 END_MARKER = "<0>"
 
 
@@ -121,6 +144,32 @@ class GhostMessage:
 
 
     def max_content_size(self):
+        """
+        Quanto TEXTO cabe numa mensagem cifrada:
+
+            255  pacote LoRa
+            -88  assinatura do salto (base64)
+             -3  marcador <0>
+            ----
+            164  caracteres de base64 para o bloco cifrado
+                 = 123 bytes de bloco
+            -40  cifragem (24 nonce + 16 autenticação)
+             -1  tipo (mensagem ou confirmação)
+            ----
+             82  bytes de texto
+
+        A "assinatura do autor" não aparece na conta porque vai fundida
+        na cifragem autenticada: abrir o bloco já prova quem o criou.
+        """
+
+        base64_livre = MAX_PACOTE - self.signature_size() - len(END_MARKER)
+
+        bloco = (base64_livre // 4) * 3
+
+        return bloco - self.identity.BOX_SOBRECARGA - 1
+
+
+    def _max_content_size_claro(self):
         """
         Quanto texto cabe em uma transmissão:
 
@@ -170,12 +219,8 @@ class GhostMessage:
 
             return "conteudo vazio"
 
-        if END_MARKER in texto:
-
-            # seção 13: o receptor escuta até encontrar o <0>. Um <0> no
-            # meio do texto faria ele considerar a mensagem terminada
-            # antes da hora.
-            return "conteudo contem o marcador de fim %s" % END_MARKER
+        # O <0> no meio do texto deixou de ser problema: o texto vai
+        # cifrado e em base64, que nunca contém "<" nem ">".
 
         tamanho = len(texto.encode("utf-8"))
 
@@ -192,7 +237,167 @@ class GhostMessage:
     # =================================================
 
 
-    def create_message(self, content):
+    # tipos, no primeiro byte do texto cifrado (invisível para os relays)
+    TIPO_MENSAGEM = b"M"
+
+    TIPO_CONFIRMACAO = b"C"
+
+
+    def _montar(self, texto_claro, destinatario, tipo_pacote):
+        """
+        [BLOCO CIFRADO EM BASE64][ASSINATURA DO SALTO]<0>
+
+        O formato de fora é o mesmo de sempre, e por isso o resto do
+        protocolo não muda: o cache, a troca de assinatura a cada salto
+        (seção 16) e a identificação do vizinho (seção 15) tratam o
+        bloco como um conteúdo qualquer. O hash do bloco é igual em
+        todos os saltos.
+        """
+
+        bloco = self.identity.cifrar_para(destinatario, texto_claro)
+
+        if bloco is None:
+
+            print("[MESSAGE] nao consegui cifrar para", str(destinatario)[:12])
+
+            return None
+
+        conteudo = base64.b64encode(bloco).decode("ascii")
+
+        assinatura = self.identity.sign(conteudo)
+
+        pacote = conteudo + assinatura + END_MARKER
+
+        if not self.fits_in_packet(pacote):
+
+            print("[MESSAGE] pacote passou de %d bytes" % MAX_PACOTE)
+
+            return None
+
+        msg_hash = self.cache.generate_hash(conteudo)
+
+        # o próprio nó não pode tratar o pacote dele como novo quando
+        # ele voltar pelo ar
+        self.cache.add(msg_hash)
+
+        return {"type": tipo_pacote, "packet": pacote, "hash": msg_hash,
+                "content": conteudo, "signature": assinatura,
+                "destinatario": destinatario, "own": True}
+
+
+    def create_message(self, content, destinatario=None):
+        """
+        Seção 5, com cifragem:
+
+            texto -> cifrar para o destinatário (autor autenticado)
+                  -> base64 -> assinatura do salto -> <0> -> hash -> cache
+
+        Devolve None se não der para transmitir.
+        """
+
+        if not destinatario:
+
+            print("[MESSAGE] mensagem sem destinatario")
+
+            return None
+
+        content = self.sanitize(content)
+
+        motivo = self.validate_content(content)
+
+        if motivo:
+
+            print("[MESSAGE] mensagem recusada:", motivo)
+
+            return None
+
+        claro = self.TIPO_MENSAGEM + content.encode("utf-8")
+
+        pacote = self._montar(claro, destinatario, "MESSAGE")
+
+        if pacote:
+
+            # o que a confirmação vai carregar: só autor e destinatário
+            # conhecem o texto, então só eles calculam este hash
+            pacote["hash_conteudo"] = hashlib.sha256(claro).hexdigest()
+
+            pacote["texto"] = content
+
+        return pacote
+
+
+    def create_confirmation(self, autor, hash_conteudo):
+        """
+        Confirmação de entrega: o hash do texto em claro, cifrado para o
+        autor. Só o destinatário verdadeiro consegue fazê-la - precisou
+        abrir a mensagem para conhecer o hash, e a cifragem autenticada
+        prova que foi ele.
+        """
+
+        try:
+
+            bruto = bytes.fromhex(hash_conteudo)
+
+        except (TypeError, ValueError):
+
+            return None
+
+        return self._montar(self.TIPO_CONFIRMACAO + bruto, autor, "CONFIRMATION")
+
+
+    def open_content(self, content, chaves_contatos):
+        """
+        Tenta abrir o conteúdo com cada contato.
+
+        None se não abriu: não é para mim, sigo como relay. Mensagem
+        para mim de quem NÃO é contato também não abre, e segue adiante
+        como tráfego alheio - não há como distinguir as duas coisas, e
+        isso é bom para o anonimato.
+
+        Se abriu:
+            {"tipo": "MESSAGE", "remetente", "texto", "hash_conteudo"}
+            {"tipo": "CONFIRMATION", "remetente", "hash_conteudo"}
+        """
+
+        if not chaves_contatos:
+
+            return None
+
+        try:
+
+            bloco = base64.b64decode(content, validate=True)
+
+        except Exception:
+
+            return None
+
+        if len(bloco) <= self.identity.BOX_SOBRECARGA:
+
+            return None
+
+        remetente, claro = self.identity.abrir_de_algum(chaves_contatos, bloco)
+
+        if not claro:
+
+            return None
+
+        tipo = claro[:1]
+
+        if tipo == self.TIPO_MENSAGEM:
+
+            return {"tipo": "MESSAGE", "remetente": remetente,
+                    "texto": claro[1:].decode("utf-8", "replace"),
+                    "hash_conteudo": hashlib.sha256(claro).hexdigest()}
+
+        if tipo == self.TIPO_CONFIRMACAO and len(claro) == 33:
+
+            return {"tipo": "CONFIRMATION", "remetente": remetente,
+                    "hash_conteudo": claro[1:].hex()}
+
+        return None
+
+
+    def create_message_claro(self, content):
         """
         Seção 5:
 

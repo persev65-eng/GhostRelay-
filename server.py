@@ -43,6 +43,14 @@ A aplicação manda texto puro (vira mensagem) ou um objeto JSON:
 
     {"tipo": "tx", "dados": "texto"}     manda uma mensagem
     {"tipo": "convite"}                  anuncia a carteira agora
+    {"tipo": "tx", "dados": "texto", "para": "<nome ou chave>"}
+                                         mensagem cifrada para um contato
+    {"tipo": "contato", "chave": "<chave publica>", "nome": "...",
+     "categoria": "pessoa" | "site"}     registra um contato (sites e
+                                         programas podem pedir; por
+                                         enquanto aceito sem perguntar)
+    {"tipo": "remover_contato", "chave": "..."}
+    {"tipo": "contatos"}                 lista os contatos
     {"tipo": "status"}                   pede o estado do nó
 
 O nó responde sempre em JSON:
@@ -540,12 +548,20 @@ HTML = """<!doctype html>
 <div class="estado" id="estado">conectando...</div>
 
 <div class="linha">
-  <input id="msg" placeholder="mensagem para a rede" autocomplete="off">
+  <select id="para" title="destinatario"><option value="">destinatario...</option></select>
+  <input id="msg" placeholder="mensagem cifrada para o contato" autocomplete="off">
   <button onclick="enviar()">enviar</button>
   <button onclick="comando('convite')">convite</button>
   <button onclick="comando('status')">status</button>
 </div>
-<div class="contador" id="contador">0 / 164 bytes</div>
+<div class="contador" id="contador">0 / 82 bytes</div>
+<div class="linha">
+  <input id="nova_chave" placeholder="chave publica do contato (44 caracteres)" autocomplete="off">
+  <input id="novo_nome" placeholder="nome" autocomplete="off" style="max-width:9em">
+  <button onclick="addContato()">adicionar contato</button>
+</div>
+<div class="contador">sua chave publica (passe para quem vai te adicionar):
+  <input id="minha_chave" readonly onclick="this.select()" style="width:100%"></div>
 
 <div id="log"></div>
 
@@ -553,7 +569,7 @@ HTML = """<!doctype html>
 // medido em BYTES: acento ocupa 2, emoji ocupa 4. O maxlength do
 // navegador conta caracteres, entao nao serve aqui - "ç" x120 passaria
 // nele e seria recusado pelo no. O valor e atualizado pelo status.
-let LIMITE = 164;
+let LIMITE = 82;
 const bytes = (s) => new TextEncoder().encode(s).length;
 let ws, log = document.getElementById('log'), campo = document.getElementById('msg');
 
@@ -590,12 +606,13 @@ function conectar(){
 
     if (d.tipo === 'rx') {
       let meta = [];
-      if (d.vizinho) meta.push('de ' + d.vizinho);
-      if (d.classe) meta.push(d.classe);
+      if (d.vizinho) meta.push('ultimo salto ' + d.vizinho);
       if (d.rssi !== undefined && d.rssi !== null) meta.push('rssi ' + d.rssi);
       if (d.sf) meta.push('SF' + d.sf);
-      escrever('rx', 'RX  ' + d.dados, meta.join('  '));
+      escrever('rx', 'RX  ' + (d.de || '?') + ': ' + d.dados, meta.join('  '));
     }
+    else if (d.tipo === 'entregue') escrever('ev', 'ENTREGUE  ' + d.dados);
+    else if (d.tipo === 'contatos') preencherContatos(d.dados || []);
     else if (d.tipo === 'erro')   escrever('err', 'ERRO  ' + d.dados);
     else if (d.tipo === 'status') mostrarStatus(d);
     else if (d.tipo === 'evento') escrever('ev', String(d.dados));
@@ -603,15 +620,35 @@ function conectar(){
   };
 }
 
+function preencherContatos(lista){
+  // nomes podem vir de um site: sempre como texto, nunca como HTML
+  const sel = document.getElementById('para'), atual = sel.value;
+  while (sel.options.length > 1) sel.remove(1);
+  for (const c of lista) sel.add(new Option(c.nome + ' (' + c.categoria + ')', c.chave));
+  if (atual) sel.value = atual;
+}
+function addContato(){
+  const chave = document.getElementById('nova_chave').value.trim();
+  const nome = document.getElementById('novo_nome').value.trim();
+  if (!chave || !ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({tipo:'contato', chave:chave, nome:nome, categoria:'pessoa'}));
+  document.getElementById('nova_chave').value = '';
+  document.getElementById('novo_nome').value = '';
+  setTimeout(() => comando('status'), 300);
+}
 function mostrarStatus(d){
   if (d.limite_texto) { LIMITE = d.limite_texto; atualizarContador(); }
+  if (d.chave_publica) document.getElementById('minha_chave').value = d.chave_publica;
+  if (d.contatos) preencherContatos(d.contatos);
   document.getElementById('estado').innerHTML =
     'carteira <b>' + (d.carteira || '?') + '</b>' +
     ' | conhecidos <b>' + (d.conhecidos || 0) + '</b>' +
     ' | candidatos <b>' + (d.candidatos || 0) + '</b>' +
     ' | fila <b>' + (d.fila || 0) + '</b>' +
     ' | corrida <b>' + (d.corrida || 0) + '</b>' +
-    ' | pagos <b>' + Math.round(d.pontos_pagos || 0) + '</b>';
+    ' | pagos <b>' + Math.round(d.pontos_pagos || 0) + '</b>' +
+    ' | entregues <b>' + (d.entregues || 0) + '</b>' +
+    ' | confirmacoes <b>' + (d.confirmacoes_recebidas || 0) + '</b>';
   escrever('st', 'STATUS  ' + JSON.stringify(d));
 }
 
@@ -624,8 +661,10 @@ function enviar(){
              ' caracteres); o maximo por pacote e ' + LIMITE + ' bytes');
     return;
   }
-  ws.send(JSON.stringify({tipo:'tx', dados:texto}));
-  escrever('tx', 'TX  ' + texto, 'na fila de retransmissao');
+  const para = document.getElementById('para').value;
+  if (!para) { escrever('err', 'ERRO  escolha o destinatario'); return; }
+  ws.send(JSON.stringify({tipo:'tx', dados:texto, para:para}));
+  escrever('tx', 'TX  ' + texto, 'cifrada, na fila');
   campo.value = '';
   atualizarContador();
 }

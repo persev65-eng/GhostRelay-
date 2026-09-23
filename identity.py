@@ -105,6 +105,12 @@ try:
 
     from nacl.signing import SigningKey, VerifyKey
 
+    # cifragem ponta a ponta: a mesma carteira Ed25519 é convertida em
+    # X25519 para cifrar. Não existe chave nova para gerenciar.
+    from nacl.public import Box
+
+    from nacl.exceptions import CryptoError
+
 except ImportError:
 
     raise ImportError(
@@ -554,6 +560,144 @@ class GhostIdentity:
             return True
 
         return self._load_from_file()
+
+
+    # =================================================
+    # CIFRAGEM PONTA A PONTA (mensagem e confirmação)
+    # =================================================
+    #
+    # Caixa autenticada (crypto_box do NaCl: X25519 + XSalsa20-Poly1305)
+    # entre a minha carteira e a do contato. Ela faz duas coisas ao
+    # mesmo tempo: só o destinatário consegue abrir, e abrir PROVA quem
+    # criou - a chave privada do autor entra na conta. Por isso a
+    # "assinatura do autor" vai fundida na própria cifragem, em vez de
+    # ocupar 64 bytes a mais dentro do bloco.
+    #
+    # Sobrecarga: 24 de nonce + 16 de autenticação = 40 bytes.
+
+    BOX_SOBRECARGA = 40
+
+
+    def _box_com(self, chave_publica):
+        """
+        Caixa com um contato. A chave compartilhada é calculada uma vez
+        por contato e guardada: abrir cada pacote recebido testa todos
+        os contatos, e recalcular o X25519 a cada teste seria caro.
+        """
+
+        if getattr(self, "_boxes_dono", None) is not self.private_key:
+
+            # carteira trocou (importação de semente): nada do cache vale
+            self._boxes = {}
+
+            self._boxes_dono = self.private_key
+
+        box = self._boxes.get(chave_publica)
+
+        if box is not None:
+
+            return box
+
+        try:
+
+            verify = VerifyKey(base64.b64decode(chave_publica))
+
+            box = Box(
+
+                self.private_key.to_curve25519_private_key(),
+
+                verify.to_curve25519_public_key()
+
+            )
+
+        except Exception:
+
+            return None
+
+        self._boxes[chave_publica] = box
+
+        return box
+
+
+    def cifrar_para(self, chave_publica, dados):
+        """
+        Bloco que só a dona de chave_publica consegue abrir.
+        Devolve bytes (nonce + texto cifrado + autenticação) ou None.
+        """
+
+        box = self._box_com(chave_publica)
+
+        if box is None:
+
+            return None
+
+        return bytes(box.encrypt(bytes(dados)))
+
+
+    def abrir_de(self, chave_publica, bloco):
+        """
+        Abre um bloco que teria vindo de chave_publica.
+        None se não abrir - não era para mim, ou não era dela.
+        """
+
+        box = self._box_com(chave_publica)
+
+        if box is None:
+
+            return None
+
+        try:
+
+            return box.decrypt(bytes(bloco))
+
+        except (CryptoError, ValueError, TypeError):
+
+            return None
+
+
+    def abrir_de_algum(self, chaves, bloco):
+        """
+        Testa o bloco contra cada chave da lista.
+
+        Devolve (chave, dados) de quem abriu, ou (None, None).
+
+        É assim que o nó descobre se é o destinatário: o pacote não diz
+        para quem é. Se nenhum contato abre, a mensagem não é para mim -
+        sigo como relay.
+        """
+
+        for chave in chaves:
+
+            dados = self.abrir_de(chave, bloco)
+
+            if dados is not None:
+
+                return chave, dados
+
+        return None, None
+
+
+    @staticmethod
+    def chave_publica_valida(chave):
+        """
+        44 caracteres de base64 que decodificam para uma chave Ed25519.
+        """
+
+        if not isinstance(chave, str) or len(chave) != PUBLIC_KEY_SIZE:
+
+            return False
+
+        try:
+
+            raw = base64.b64decode(chave, validate=True)
+
+            VerifyKey(raw)
+
+            return len(raw) == 32
+
+        except Exception:
+
+            return False
 
 
     # =================================================

@@ -500,6 +500,8 @@ class Storage:
 
             "relay_queue",
 
+            "contacts",
+
             "node_state"
 
         ]

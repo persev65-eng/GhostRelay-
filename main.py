@@ -1,6 +1,23 @@
 #!/usr/bin/env python3
 
 """
+CONFIRMAÇÃO DE ENTREGA - COMO O NÓ FUNCIONA AGORA
+-------------------------------------------------
+Só o autor paga, e só mensagem própria entra na lista corrida.
+
+  autor         cifra para o contato, abre DUAS corridas de mesmo valor
+  relay         não lê, reassina, retransmite; não paga ninguém
+  destinatário  abre, entrega ao app, devolve a confirmação (hash do
+                texto cifrado para o autor); não retransmite a mensagem
+                e não paga quem carregar a confirmação
+  autor         ao receber a primeira confirmação: libera a corrida da
+                ida (retida até aqui), credita o destinatário em
+                CONTATOS com o valor da mensagem, e paga a corrida da
+                volta a cada cópia da confirmação que chegar
+
+Prioridade da confirmação, no destinatário:
+    max(1, pontos do contato) x tempo da mensagem / tempo da confirmação
+
 GhostRelay - Main Controller
 
 Responsabilidade:
@@ -174,6 +191,17 @@ except Exception:
 
 try:
 
+    from contacts import ContactBook
+
+except Exception as erro:
+
+    print("contacts.py indisponivel:", erro)
+
+    ContactBook = None
+
+
+try:
+
     from race import RaceList
 
 except Exception:
@@ -240,10 +268,15 @@ INTERVALO_CONVITE = 300          # s   (usado só no modo periódico)
 PRIORIDADE_MINIMA = 0.0
 
 
-# Seção 20, item 6: mensagem retransmitida também entra na lista
-# corrida. É isso que permite promover um candidato que ajudou a
-# carregar tráfego que não é meu (seção 19).
-CORRIDA_RETRANSMITIDAS = True
+# Só o autor paga, e só mensagem PRÓPRIA entra na lista corrida (seção 7).
+# Se relay pagasse relay, o autor ganharia pontos infinitos: B registra
+# a mensagem de A na corrida dele, A repete, e B paga A pela mensagem do
+# próprio A. A constante que ligava isso saiu.
+
+# O destinatário também retransmite a mensagem que era para ele?
+# Não retransmitir economiza antena (ela já chegou). Retransmitir esconde
+# melhor quem é o destinatário, porque ele se comporta como um relay.
+DESTINATARIO_RETRANSMITE = False
 
 
 INTERVALO_MANUTENCAO = 10        # s
@@ -289,7 +322,13 @@ class GhostRelayNode:
 
             "convites_rx": 0,
 
-            "pontos_pagos": 0.0
+            "pontos_pagos": 0.0,
+
+            "entregues": 0,
+
+            "confirmacoes_enviadas": 0,
+
+            "confirmacoes_recebidas": 0
 
         }
 
@@ -324,6 +363,14 @@ class GhostRelayNode:
         # -------------------------
         # CACHE
         # -------------------------
+
+        self.contacts = None
+
+        if ContactBook:
+
+            print("Iniciando contatos...")
+
+            self.contacts = ContactBook(storage=self.storage)
 
         print("Iniciando cache...")
 
@@ -486,85 +533,115 @@ class GhostRelayNode:
     # =================================================
 
     def process_application_message(self, data):
-
         """
-        Seção 5:
+        Seções 5 e 22. A aplicação manda:
 
-        criar -> assinar -> <0> -> hash -> cache
-              -> lista corrida -> fila de retransmissão
+            {"tipo": "tx", "dados": "texto", "para": "<chave ou nome>"}
+            {"tipo": "contato", "chave": "...", "nome": "...",
+             "categoria": "pessoa" | "site"}
+            {"tipo": "remover_contato", "chave": "..."}
+            {"tipo": "contatos"}
+            {"tipo": "convite"}
 
-        Fluxo:
-
-        server.py -> main.py -> message.py -> economy.py
-                  -> race.py -> relay_queue.py -> mac.py
+        Toda mensagem tem destinatário: ela vai cifrada para ele.
         """
 
-        if not data:
+        if not data or not self.messages:
 
             return
 
-        if not self.messages:
+        para = ""
 
-            return
-
-        # a aplicação pode pedir um convite a qualquer momento,
-        # nos dois modos
         if isinstance(data, dict):
 
-            if (data.get("tipo") or data.get("type")) in ("convite", "invite"):
+            tipo = str(data.get("tipo") or data.get("type") or "tx").lower()
+
+            if tipo in ("convite", "invite"):
 
                 return self.criar_convite()
 
-            data = data.get("dados") or data.get("data") or ""
+            if tipo in ("contato", "contact"):
 
-        data = str(data).strip()
+                return self.registrar_contato(data)
 
-        if data.lower() in ("/convite", "/invite"):
+            if tipo == "remover_contato":
 
-            return self.criar_convite()
+                removido = (self.contacts.remove(data.get("chave") or data.get("nome"))
+                            if self.contacts else False)
 
-        if not data:
+                return self.entregar_para_app({
+
+                    "tipo": "evento" if removido else "erro",
+
+                    "dados": "contato removido" if removido else "contato nao encontrado"
+
+                })
+
+            if tipo in ("contatos", "contacts"):
+
+                return self.entregar_para_app({
+
+                    "tipo": "contatos",
+
+                    "dados": self.contacts.listar() if self.contacts else []
+
+                })
+
+            texto = data.get("dados") or data.get("data") or ""
+
+            para = data.get("para") or data.get("to") or ""
+
+        else:
+
+            texto = str(data)
+
+            if texto.strip().lower() in ("/convite", "/invite"):
+
+                return self.criar_convite()
+
+        texto = str(texto).strip()
+
+        if not texto:
 
             return
 
-        # o message.py limpa o texto e confere o limite do pacote
-        # (255 bytes do LoRa - 88 de assinatura - 3 do marcador = 164)
-        pacote = self.messages.create_message(data)
+        destino = self.contacts.find(para) if (self.contacts and para) else None
+
+        if not destino:
+
+            return self.entregar_para_app({
+
+                "tipo": "erro",
+
+                "dados": ("destinatario nao e um contato: %s" % para) if para
+
+                         else "informe o destinatario: a mensagem vai cifrada para um contato"
+
+            })
+
+        pacote = self.messages.create_message(texto, destino)
 
         if not pacote:
 
-            # a aplicação precisa saber por que a mensagem não saiu;
-            # antes ela era recusada em silêncio
             motivo = self.messages.validate_content(
 
-                self.messages.sanitize(data)
+                self.messages.sanitize(texto)
 
             ) or "mensagem recusada"
 
-            self.entregar_para_app({"tipo": "erro", "dados": motivo})
-
-            return
+            return self.entregar_para_app({"tipo": "erro", "dados": motivo})
 
         radio = self.radio_padrao()
 
-        # seção 8: o valor é o tempo de antena do pacote inteiro,
-        # mensagem + assinatura + <0>
+        # seção 8: o valor é decidido aqui, uma vez
         pontos = self.economy.message_points(
 
-            pacote["packet"],
-
-            radio["sf"],
-
-            radio["bw"],
-
-            radio["cr"]
+            pacote["packet"], radio["sf"], radio["bw"], radio["cr"]
 
         )
 
-        # seção 7: mensagem própria entra na lista corrida
-        self.registrar_corrida(pacote["hash"], pontos, radio)
+        self.registrar_corrida(pacote, pontos, radio)
 
-        # seção 9: maior pontuação dos vizinhos + 1
         prioridade = self.economy.own_message_priority(
 
             self.neighbors.highest_points() if self.neighbors else 0
@@ -575,12 +652,54 @@ class GhostRelayNode:
 
         self.stats["proprias"] += 1
 
-        print("MENSAGEM PROPRIA: %s | %.0f pontos | prioridade %.1f"
-              % (pacote["hash"][:12], pontos, prioridade))
+        print("MENSAGEM PROPRIA para %s: %s | vale %.0f pontos | prioridade %.1f"
+              % (self.contacts.nome(destino), pacote["hash"][:12], pontos, prioridade))
 
-    # =================================================
-    # CONVITE (seção 12)
-    # =================================================
+
+    def registrar_contato(self, data):
+        """
+        Registro manual ou por pedido de site/programa.
+        Por enquanto aceito sem perguntar ao usuário.
+        """
+
+        if not self.contacts:
+
+            return
+
+        chave = str(data.get("chave") or data.get("key") or "").strip()
+
+        if chave == self.identity.get_public_key():
+
+            return self.entregar_para_app({
+
+                "tipo": "erro", "dados": "essa e a carteira deste proprio no"
+
+            })
+
+        contato = self.contacts.add(
+
+            chave,
+
+            nome=data.get("nome") or data.get("name"),
+
+            categoria=data.get("categoria") or data.get("category") or "pessoa",
+
+            origem=data.get("origem") or "app"
+
+        )
+
+        if not contato:
+
+            return self.entregar_para_app({"tipo": "erro", "dados": "chave publica invalida"})
+
+        self.entregar_para_app({
+
+            "tipo": "evento",
+
+            "dados": "contato registrado: %s (%s)" % (contato["nome"], contato["categoria"])
+
+        })
+
 
     def criar_convite(self):
         """
@@ -668,24 +787,25 @@ class GhostRelayNode:
     # LISTA CORRIDA (seções 7 e 21)
     # =================================================
 
-    def registrar_corrida(self, msg_hash, pontos, radio, propria=True):
+    def registrar_corrida(self, pacote, pontos, radio):
         """
-        Seções 7 e 8 - hash + valor em pontos, e o valor é o tempo de
-        antena da mensagem.
-
-        O SF/BW/CR com que ela saiu vai junto: é o que a seção 21 manda
-        comparar quando ela voltar.
+        Seções 7 e 8 - SÓ mensagem própria. O valor é o tempo de antena
+        dela, decidido aqui uma vez; depois só cai pela metade a cada
+        posição, nas duas corridas.
         """
 
         if not self.race:
 
             return
 
-        self.race.add_message(msg_hash, pontos, radio, own=propria)
+        self.race.add_message(
 
-    # =================================================
-    # EVENTOS DO MAC
-    # =================================================
+            pacote["hash"], pontos, radio,
+
+            pacote["hash_conteudo"], pacote["destinatario"]
+
+        )
+
 
     def process_mac_event(self, event):
 
@@ -709,11 +829,10 @@ class GhostRelayNode:
 
             if entrada:
 
-                print("TX FINALIZADO: %s | vale %.0f pontos"
-                      " | proxima posicao %.0f"
-                      % (str(event.get("hash"))[:12],
-                         entrada["initial_points"],
-                         entrada["current_points"]))
+                print("TX FINALIZADO: %s | vale %.0f pontos | %s"
+                      % (str(event.get("hash"))[:12], entrada["valor"],
+                         "confirmada" if entrada["confirmada"]
+                         else "aguardando confirmacao"))
 
             else:
 
@@ -830,6 +949,29 @@ class GhostRelayNode:
     # =================================================
 
     def processar_pacote_recebido(self, event):
+        """
+        A ordem da recepção:
+
+         1  separar <0> e a assinatura do salto          seção 13
+         2  hash do bloco (igual em todos os saltos)     seção 14
+         3  convite?  -> vizinho desconhecido, PARA      seções 12 e 18
+         4  a MINHA mensagem voltando?
+                -> corrida da ida (retida até confirmar), PARA
+         5  uma cópia da MINHA confirmação já reconhecida?
+                -> corrida da volta, PARA
+         6  já está no cache?  -> descarta               seção 14
+         7  a assinatura do salto é de vizinho?          seção 15
+         8  registra no cache
+         9  tenta abrir com os contatos:
+                mensagem para mim    -> app + confirmação
+                confirmação para mim -> libera a ida, credita o contato,
+                                        corrida da volta
+                não abriu            -> sou relay           seções 16-21
+
+        4 e 5 vêm ANTES do cache pelo mesmo motivo de sempre: a minha
+        mensagem e a confirmação dela já estão no meu cache, e voltar é
+        justamente o que precisa ser contado.
+        """
 
         pacote = event.get("packet")
 
@@ -841,18 +983,10 @@ class GhostRelayNode:
 
         radio = event.get("radio") or self.radio_padrao()
 
-        # O tempo de antena NÃO é calculado aqui. A maior parte dos
-        # pacotes que chegam não precisa dele: duplicata é descartada
-        # pelo cache, retorno é pago com o valor que JÁ está na lista
-        # corrida, assinatura desconhecida é descartada. Ele é
-        # calculado uma única vez, lá no passo 8, quando a mensagem
-        # realmente vai virar prioridade e valor.
-
         if not self.messages:
 
             return
 
-        # ---- 1: separar o <0> e a assinatura (seção 13) -------------
         decodificado = self.messages.decode_packet(pacote)
 
         if not decodificado:
@@ -863,40 +997,34 @@ class GhostRelayNode:
 
         assinatura = decodificado["signature"]
 
-        # ---- 2: hash só da mensagem (seção 14) ----------------------
         msg_hash = self.cache.generate_hash(conteudo)
 
-        # ---- 3: é convite? (seções 12 e 18) -------------------------
+        # ---- 3 ----
         if self.messages.is_invite(conteudo, assinatura):
 
-            return self.tratar_convite(
+            return self.tratar_convite(conteudo, assinatura, msg_hash)
 
-                conteudo, assinatura, msg_hash
-
-            )
-
-        # ---- 4: minha mensagem voltando? (seções 10, 19 e 21) -------
-        #
-        # Vem ANTES do cache: a mensagem própria já entrou no cache na
-        # hora de ser criada (seção 5), então testar o cache primeiro
-        # mataria a recompensa antes de ela ser paga.
+        # ---- 4 ----
         if self.race and self.race.find(msg_hash):
 
-            return self.recompensar(msg_hash, conteudo, assinatura, radio)
+            return self.retorno_da_ida(msg_hash, conteudo, assinatura, radio)
 
-        # ---- 5: já vi essa mensagem? (seções 6 e 14) ----------------
+        # ---- 5 ----
+        if self.race:
+
+            entrada = self.race.find_confirmacao(msg_hash)
+
+            if entrada:
+
+                return self.retorno_da_volta(entrada, conteudo, assinatura, radio)
+
+        # ---- 6 ----
         if self.cache.exists(msg_hash):
 
             return self.descartar("duplicada")
 
-        # ---- 6: de qual carteira é a assinatura? (seção 15) ---------
-        dono = self.messages.identify_signature_owner(
-
-            conteudo,
-
-            assinatura
-
-        )
+        # ---- 7 ----
+        dono = self.messages.identify_signature_owner(conteudo, assinatura)
 
         if dono is None:
 
@@ -906,22 +1034,43 @@ class GhostRelayNode:
 
             return self.descartar("eco da minha propria transmissao")
 
-        # ---- 7: registrar no cache ----------------------------------
+        # ---- 8 ----
         self.cache.add(msg_hash)
 
-        # ---- 8: prioridade (seções 17 e 20) -------------------------
-        #
-        # Único ponto em que o tempo de antena desta mensagem é medido.
-        # O mesmo número serve para a prioridade (seções 17 e 20) e
-        # para o valor na lista corrida (seção 8), porque 1 ms = 1
-        # ponto. Depois disto ele nunca mais é recalculado: quem manda
-        # é o valor guardado na corrida, caindo pela metade a cada
-        # retorno (seção 10).
+        # ---- 9 ----
+        aberto = None
+
+        if self.contacts:
+
+            aberto = self.messages.open_content(conteudo, self.contacts.chaves())
+
+        if aberto and aberto["tipo"] == "CONFIRMATION":
+
+            return self.chegada_da_confirmacao(aberto, msg_hash, dono, radio)
+
+        if aberto and aberto["tipo"] == "MESSAGE":
+
+            self.mensagem_para_mim(aberto, pacote, dono, radio, event)
+
+            if not DESTINATARIO_RETRANSMITE:
+
+                return
+
+        return self.retransmitir(conteudo, msg_hash, pacote, dono, radio)
+
+
+    def retransmitir(self, conteudo, msg_hash, pacote, dono, radio):
+        """
+        Não é para mim: sou relay. Troco a assinatura do salto
+        (seção 16), calculo a prioridade (seções 17 e 20) e enfileiro
+        com os mesmos SF/BW/CR (seção 21).
+
+        NÃO entra na lista corrida: relay não paga ninguém.
+        """
+
         tempo = self.economy.message_time_ms(
 
-            pacote,
-
-            radio["sf"], radio["bw"], radio["cr"]
+            pacote, radio["sf"], radio["bw"], radio["cr"]
 
         )
 
@@ -931,13 +1080,9 @@ class GhostRelayNode:
 
             prioridade = self.economy.known_neighbor_priority(
 
-                self.pontos_do_vizinho(dono),
+                self.pontos_do_vizinho(dono), tempo,
 
-                tempo,
-
-                radio["sf"], radio["bw"], radio["cr"],
-
-                packet=pacote
+                radio["sf"], radio["bw"], radio["cr"], packet=pacote
 
             )
 
@@ -945,57 +1090,52 @@ class GhostRelayNode:
 
             prioridade = self.economy.unknown_neighbor_priority(
 
-                tempo,
-
-                radio["sf"], radio["bw"], radio["cr"],
-
-                packet=pacote
+                tempo, radio["sf"], radio["bw"], radio["cr"], packet=pacote
 
             )
 
-        # ---- 9: trocar a assinatura pela minha (seção 16) -----------
         relay = self.messages.rebuild_relay_message(conteudo)
 
-        # ---- 10: entrar na lista corrida (seção 20, item 6) ---------
-        if CORRIDA_RETRANSMITIDAS:
-
-            # 1 ms = 1 ponto: é o mesmo número do passo 8. O pacote que
-            # eu vou transmitir tem exatamente o tamanho do que chegou
-            # (mesmo conteúdo, mesma assinatura de 88 caracteres), então
-            # não há o que recalcular.
-            self.registrar_corrida(msg_hash, tempo, radio, propria=False)
-
-        # ---- 11: enfileirar com os MESMOS SF/BW/CR (seção 21) -------
         self.enfileirar(
 
             {"packet": relay["packet"], "hash": msg_hash},
 
-            prioridade,
-
-            radio,
-
-            tipo="MESSAGE"
+            prioridade, radio, tipo="MESSAGE"
 
         )
 
         self.stats["retransmitidos"] += 1
 
-        print("RX %s de %s (%s) prioridade %.3f"
-              % (msg_hash[:12], dono[:12], tipo_vizinho or "desconhecido",
-                 prioridade))
+        print("RELAY %s de %s (%s) prioridade %.3f"
+              % (msg_hash[:12], dono[:12], tipo_vizinho or "candidato", prioridade))
 
-        # ---- 12: entregar para a aplicação --------------------------
+
+    def mensagem_para_mim(self, aberto, pacote, dono, radio, event):
+        """
+        Sou o destinatário. Entrego o texto e devolvo a confirmação:
+        o hash do texto em claro, cifrado para o autor.
+
+        A confirmação NÃO entra na minha lista corrida: quem paga quem a
+        carregar é o autor, quando ela chegar nele.
+        """
+
+        autor = aberto["remetente"]
+
+        self.stats["entregues"] += 1
+
+        nome = self.contacts.nome(autor) if self.contacts else autor[:12]
+
         self.entregar_para_app({
 
             "tipo": "rx",
 
-            "dados": conteudo,
+            "dados": aberto["texto"],
 
-            "hash": msg_hash[:12],
+            "de": nome,
+
+            "chave": autor[:12],
 
             "vizinho": dono[:12],
-
-            "classe": tipo_vizinho or "candidato",
 
             "rssi": event.get("rssi"),
 
@@ -1005,9 +1145,195 @@ class GhostRelayNode:
 
         })
 
-    # =================================================
-    # CONVITE RECEBIDO (seção 18)
-    # =================================================
+        confirmacao = self.messages.create_confirmation(autor, aberto["hash_conteudo"])
+
+        if not confirmacao:
+
+            print("nao consegui montar a confirmacao para", nome)
+
+            return
+
+        # a confirmação viaja com os mesmos SF/BW/CR da mensagem (seção 21)
+        tempo_mensagem = self.economy.message_time_ms(
+
+            pacote, radio["sf"], radio["bw"], radio["cr"]
+
+        )
+
+        tempo_confirmacao = self.economy.message_time_ms(
+
+            confirmacao["packet"], radio["sf"], radio["bw"], radio["cr"]
+
+        )
+
+        prioridade = self.economy.confirmation_priority(
+
+            self.contacts.get_points(autor) if self.contacts else 0,
+
+            tempo_mensagem,
+
+            tempo_confirmacao
+
+        )
+
+        self.enfileirar(confirmacao, prioridade, radio, tipo="CONFIRMATION")
+
+        self.stats["confirmacoes_enviadas"] += 1
+
+        print("ENTREGUE: mensagem de %s | confirmacao na fila, prioridade %.2f"
+              % (nome, prioridade))
+
+
+    def chegada_da_confirmacao(self, aberto, hash_bloco, dono, radio):
+        """
+        Primeira vez que vejo ESTA confirmação - sou o autor.
+
+        Se for a primeira confirmação da mensagem: libero a corrida da
+        ida retida e credito o destinatário em contatos. Em qualquer
+        caso, quem a entregou ocupa uma posição na corrida da volta.
+        """
+
+        destinatario = aberto["remetente"]
+
+        entrada = (self.race.find_por_conteudo(aberto["hash_conteudo"], destinatario)
+                   if self.race else None)
+
+        if not entrada:
+
+            return self.descartar("confirmacao de mensagem fora da minha corrida")
+
+        self.stats["confirmacoes_recebidas"] += 1
+
+        resultado = self.race.confirmar(entrada["hash"], hash_bloco)
+
+        if resultado["primeira"]:
+
+            nome = self.contacts.nome(destinatario) if self.contacts else destinatario[:12]
+
+            print("CONFIRMADA: %s recebeu %s" % (nome, entrada["hash"][:12]))
+
+            for chave, pontos in resultado["liberar"]:
+
+                self._pagar(chave, entrada["hash"], pontos, "ida liberada")
+
+            if resultado["contato"] and self.contacts:
+
+                chave_dest, valor = resultado["contato"]
+
+                total = self.contacts.add_points(chave_dest, valor)
+
+                if total is not None:
+
+                    print("CONTATO: +%.0f pontos para %s | total %.0f"
+                          % (valor, nome, total))
+
+            self.entregar_para_app({
+
+                "tipo": "entregue",
+
+                "dados": "mensagem entregue a %s" % nome,
+
+                "hash": entrada["hash"][:12]
+
+            })
+
+        return self._pagar_volta(entrada, dono, radio)
+
+
+    def retorno_da_ida(self, msg_hash, conteudo, assinatura, radio):
+        """
+        Seções 10, 19 e 21 - a minha mensagem voltou retransmitida.
+        A posição é ocupada agora; o pagamento espera a confirmação.
+        """
+
+        dono = self.messages.identify_signature_owner(conteudo, assinatura)
+
+        if dono is None:
+
+            return self.descartar("volta com assinatura desconhecida")
+
+        if dono == self.identity.get_public_key():
+
+            return self.descartar("eco da minha propria transmissao")
+
+        r = self.race.retorno_ida(msg_hash, dono, radio)
+
+        if not r["ok"]:
+
+            print("SEM RECOMPENSA para %s: %s" % (dono[:12], r["motivo"]))
+
+            return
+
+        if r["retido"]:
+
+            print("RETIDO: posicao %d da ida | %.0f pontos para %s aguardam a confirmacao"
+                  % (r["posicao"], r["pontos"], dono[:12]))
+
+            return
+
+        self._pagar(dono, msg_hash, r["pontos"], "ida posicao %d" % r["posicao"])
+
+
+    def retorno_da_volta(self, entrada, conteudo, assinatura, radio):
+        """
+        Outra cópia de uma confirmação que eu já reconheci.
+        """
+
+        dono = self.messages.identify_signature_owner(conteudo, assinatura)
+
+        if dono is None:
+
+            return self.descartar("confirmacao com assinatura desconhecida")
+
+        if dono == self.identity.get_public_key():
+
+            return self.descartar("eco da minha propria transmissao")
+
+        return self._pagar_volta(entrada, dono, radio)
+
+
+    def _pagar_volta(self, entrada, dono, radio):
+
+        r = self.race.retorno_volta(entrada["hash"], dono, radio)
+
+        if not r["ok"]:
+
+            print("SEM RECOMPENSA (volta) para %s: %s" % (dono[:12], r["motivo"]))
+
+            return
+
+        self._pagar(dono, entrada["hash"], r["pontos"], "volta posicao %d" % r["posicao"])
+
+
+    def _pagar(self, chave, msg_hash, pontos, origem):
+        """
+        Seção 19, na ordem certa: promove o candidato e DEPOIS credita.
+        Uma posição retida é promovida só quando é paga - promover sem
+        crédito deixaria o vizinho com zero, atrás de um desconhecido.
+        """
+
+        if not self.neighbors:
+
+            return
+
+        resultado = self.neighbors.register_relay_help(chave, msg_hash, pontos)
+
+        if not resultado:
+
+            print("sem carteira para pagar %.0f pontos (%s): %s"
+                  % (pontos, origem, chave[:12]))
+
+            return
+
+        if resultado["promovido"]:
+
+            print("PROMOVIDO A VIZINHO CONHECIDO:", chave[:12])
+
+        self.stats["pontos_pagos"] += pontos
+
+        print("RECOMPENSA (%s): +%.0f pontos para %s | total %.0f"
+              % (origem, pontos, chave[:12], resultado["total"]))
+
 
     def tratar_convite(self, chave, assinatura, msg_hash):
         """
@@ -1047,91 +1373,6 @@ class GhostRelayNode:
 
     # =================================================
     # RECOMPENSA (seções 10, 19 e 21)
-    # =================================================
-
-    def recompensar(self, msg_hash, conteudo, assinatura, radio):
-        """
-        Seções 10, 19 e 21.
-
-        Um nó PODE retransmitir a mesma mensagem várias vezes, e isso é
-        parte do protocolo: é o que dá à mensagem mais chances de
-        atravessar a rede.
-
-        Cada retorno ocupa uma POSIÇÃO na lista de recompensa daquela
-        mensagem, e o valor da posição é metade do valor da anterior --
-        não importa quem voltou:
-
-            mensagem de A vale 100
-
-            1o retorno -> B     100 pontos
-            2o retorno -> C      50 pontos
-            3o retorno -> B      25 pontos
-            4o retorno -> ...  12,5 pontos
-
-        A mesma carteira pode ocupar várias posições (adendo da seção
-        10). O freio é econômico, não uma regra: repetir custa o mesmo
-        tempo de antena e rende metade. A entrada continua pagando até
-        sair da lista corrida, e ela só sai por FIFO, quando a lista
-        lota (seção 23).
-        """
-
-        dono = self.messages.identify_signature_owner(
-
-            conteudo,
-
-            assinatura
-
-        )
-
-        if dono is None:
-
-            return self.descartar("volta com assinatura desconhecida")
-
-        if dono == self.identity.get_public_key():
-
-            return self.descartar("eco da minha propria transmissao")
-
-        # Seções 10 e 21: a lista corrida confere o SF/BW/CR e devolve
-        # a posição ocupada. Retorno recusado não consome posição.
-        retorno = self.race.process_return(msg_hash, dono, radio)
-
-        if not retorno["ok"]:
-
-            print("SEM RECOMPENSA para %s: %s" % (dono[:12], retorno["motivo"]))
-
-            return
-
-        pontos = retorno["pontos"]
-
-        if not self.neighbors:
-
-            return
-
-        # Seção 19: registra a ajuda, promove se for candidato e só
-        # depois credita os pontos. Quem valida que a ajuda é real é
-        # este método aqui em cima: hash na lista corrida e SF/BW/CR
-        # conferidos.
-        resultado = self.neighbors.register_relay_help(
-
-            dono, msg_hash, pontos
-
-        )
-
-        if not resultado:
-
-            return
-
-        if resultado["promovido"]:
-
-            print("PROMOVIDO A VIZINHO CONHECIDO:", dono[:12])
-
-        self.stats["pontos_pagos"] += pontos
-
-        print("RECOMPENSA: posicao %d | +%.0f pontos para %s | total %.0f"
-              % (retorno["posicao"], pontos, dono[:12], resultado["total"]))
-
-    # =================================================
-    # APOIO
     # =================================================
 
     def descartar(self, motivo):
@@ -1244,9 +1485,24 @@ class GhostRelayNode:
 
             "descartados": self.stats["descartados"],
 
-            "pontos_pagos": round(self.stats["pontos_pagos"], 1)
+            "pontos_pagos": round(self.stats["pontos_pagos"], 1),
+
+            "entregues": self.stats["entregues"],
+
+            "confirmacoes_enviadas": self.stats["confirmacoes_enviadas"],
+
+            "confirmacoes_recebidas": self.stats["confirmacoes_recebidas"]
 
         })
+
+        # a chave inteira: é o que outro nó precisa para me registrar
+        dados["chave_publica"] = self.identity.get_public_key()
+
+        dados["contatos"] = self.contacts.listar() if self.contacts else []
+
+        if self.race:
+
+            dados["corrida_detalhe"] = self.race.resumo()
 
         return dados
 
@@ -1286,6 +1542,10 @@ class GhostRelayNode:
             if self.race:
 
                 self.race.save()
+
+            if self.contacts:
+
+                self.contacts.save()
 
             print("estado salvo")
 

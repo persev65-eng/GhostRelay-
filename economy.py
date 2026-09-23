@@ -749,6 +749,44 @@ class GhostEconomy:
     # =====================================================
 
     @staticmethod
+    def confirmation_priority(pontos_contato, tempo_mensagem_ms,
+                              tempo_confirmacao_ms):
+        """
+        Prioridade da confirmação de entrega, no nó DESTINATÁRIO.
+
+            max(1, pontos do contato) x tempo da mensagem
+            ---------------------------------------------
+                     tempo da confirmação
+
+        O numerador é a regra combinada: mais pontos de contato e
+        mensagem maior dão mais urgência - o crédito que a confirmação
+        vai destravar no autor é o valor da mensagem. O piso 1 é o que
+        permite a primeira confirmação entre dois nós que nunca se
+        falaram; sem ele, 0 x tempo = 0 e ninguém começa nunca.
+
+        O denominador põe a confirmação na mesma escala do resto da
+        fila. Sem ele, em SF12 ela entrava com ~24 milhões contra
+        ~15 mil de uma mensagem própria, e era transmitida 11 vezes
+        seguidas (54 s de antena) antes de qualquer outra coisa ter
+        vez. Dividir pelo próprio custo é a mesma lógica da seção 17 -
+        benefício por milissegundo gasto - e não muda a ORDEM entre
+        confirmações, porque o custo delas é o mesmo.
+        """
+
+        multiplicador = max(1.0, float(pontos_contato or 0))
+
+        tempo_mensagem = max(0.0, float(tempo_mensagem_ms or 0))
+
+        custo = float(tempo_confirmacao_ms or 0)
+
+        if custo <= 0:
+
+            return multiplicador * tempo_mensagem
+
+        return multiplicador * tempo_mensagem / custo
+
+
+    @staticmethod
     def reduce_priority(priority):
 
         try:
